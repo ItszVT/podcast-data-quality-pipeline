@@ -15,7 +15,7 @@ From a Data Analyst / Analytics Engineer perspective, the project demonstrates a
 - Day 5: SQL analytics and controlled-reference evaluation
 - Day 6: read-only Streamlit dashboard with plain-language findings, searchable records, and native charts
 - Day 7: final QA and portfolio documentation review
-- Phase 2, Step 1: manual collection, validation, and append-only SQLite pipeline (scheduling not configured)
+- Phase 2, Step 1: append-only SQLite pipeline with scheduled GitHub Actions publication and Streamlit Community Cloud support
 - Real-data fixture: standalone, safety-conscious Apple Search API/RSS collector (`data/real_podcasts.csv`); synthetic fixtures remain unchanged
 
 ## Architecture
@@ -93,7 +93,7 @@ Run one collection, validation, and SQLite persistence cycle manually from the p
 python -m src.daily_pipeline
 ~~~
 
-The default output is a new audit snapshot in data/real_podcast_audits.sqlite. The command does not write or replace either podcast CSV and does not run publisher website checks. It reports stage statuses, row/finding totals, and errors; validation findings do not mean execution failed. See docs/daily-pipeline.md for options, partial/failure behavior, and safe reruns. This step does not configure Task Scheduler.
+The default output is a new audit snapshot in data/real_podcast_audits.sqlite. The command does not write or replace either podcast CSV and does not run publisher website checks. It reports stage statuses, row/finding totals, and errors; validation findings do not mean execution failed. See docs/daily-pipeline.md for options, partial/failure behavior, and safe reruns. GitHub Actions can run this pipeline daily and publish the SQLite history; see [`docs/cloud-mvp-deployment.md`](docs/cloud-mvp-deployment.md).
 
 ## Run tests
 
@@ -133,7 +133,9 @@ The four cases cover specific branches only. Their agreement does not estimate a
 streamlit run app.py
 ```
 
-The sidebar defaults to `data/real_podcast_audits.sqlite` when present, otherwise `data/podcast_audits.sqlite`; either existing database can be selected. The dashboard opens SQLite in read-only mode, never creates or changes a database, and does not run URL checks or make network requests. It presents findings, searchable podcast records, saved website results, audit history, and evaluation context in plain language. See [`docs/dashboard.md`](docs/dashboard.md) for layout, definitions, and the saved real-audit findings.
+The sidebar defaults to `data/real_podcast_audits.sqlite`; another existing database can be selected. A missing real audit is reported rather than silently replaced with synthetic data. The dashboard opens SQLite in read-only mode and never changes audit history. Local mode makes no network requests; published mode retrieves only the versioned SQLite snapshot from GitHub and never runs website checks. It presents findings, searchable podcast records, saved website results, audit history, and evaluation context in plain language. See [`docs/dashboard.md`](docs/dashboard.md) for layout, definitions, and the saved real-audit findings.
+
+For the scheduled GitHub Actions and Streamlit Community Cloud MVP, see [`docs/cloud-mvp-deployment.md`](docs/cloud-mvp-deployment.md). Published mode reads the latest SQLite snapshot from a private Git branch using a read-only GitHub token stored in Streamlit app secrets.
 
 ## Security and limitations
 
@@ -143,7 +145,7 @@ The sidebar defaults to `data/real_podcast_audits.sqlite` when present, otherwis
 - Detail tables are bounded, the app has no export or bulk audit workflow, and evaluation results are not persisted.
 - The controlled reference fixture and `data/sample_podcasts.csv` are synthetic. `data/real_podcasts.csv` contains public metadata collected from Apple’s Search API and publisher RSS feeds, as described in the collection report. Verify applicable source terms and attribution requirements before redistributing that dataset. No credentials or private user data are intended to be included.
 
-Potential next improvements include daily scheduling, persisted evaluation reports, and a manual dashboard screenshot captured from clearly labeled synthetic records. Scheduling is not part of the current implementation.
+Potential next improvements include persisted evaluation reports and a manual dashboard screenshot captured from clearly labeled synthetic records. The cloud schedule and snapshot publication setup are documented in [`docs/cloud-mvp-deployment.md`](docs/cloud-mvp-deployment.md).
 
 ## Portfolio and GitHub
 

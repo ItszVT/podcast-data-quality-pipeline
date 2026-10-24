@@ -8,7 +8,7 @@ From the repository root with the project virtual environment active:
 streamlit run app.py
 ```
 
-The database field selects an existing audit database. The dashboard defaults to `data/real_podcast_audits.sqlite` when that file exists; otherwise it uses `data/podcast_audits.sqlite`. You can select either saved database. A missing database displays an error and is never created here. **Refresh saved data** reloads the view. SQLite connections are opened with `mode=ro` and `PRAGMA query_only=ON`; dashboard actions do not write records or run website checks.
+The database field selects an existing local audit database. The dashboard defaults to `data/real_podcast_audits.sqlite` and reports a missing real audit instead of silently falling back to synthetic data. A local missing database is never created. In published mode, the app fetches the latest SQLite snapshot from the private `audit-snapshots` Git branch using a read-only GitHub token in app secrets. The remote snapshot is deserialized into an in-memory SQLite connection and is not written to the app filesystem. **Refresh saved data** reloads the view. SQLite connections are read-only; dashboard actions do not write records or run website checks. See [cloud-mvp-deployment.md](cloud-mvp-deployment.md) for Streamlit Community Cloud setup.
 
 ## Page structure
 

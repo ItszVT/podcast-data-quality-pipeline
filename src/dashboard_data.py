@@ -6,14 +6,21 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
+from urllib.parse import quote
+
+import requests
 
 from .database_config import DatabaseConfigurationError, require_sqlite_backend
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 REAL_DATABASE_PATH = PROJECT_ROOT / "data" / "real_podcast_audits.sqlite"
 SYNTHETIC_DATABASE_PATH = PROJECT_ROOT / "data" / "podcast_audits.sqlite"
-# Prefer the collected real audit when present; retain the synthetic file as a fallback.
-DEFAULT_DATABASE_PATH = REAL_DATABASE_PATH if REAL_DATABASE_PATH.is_file() else SYNTHETIC_DATABASE_PATH
+DEFAULT_DATABASE_PATH = REAL_DATABASE_PATH
+SNAPSHOT_OWNER = "ItszVT"
+SNAPSHOT_REPOSITORY = "podcast-data-quality-pipeline"
+SNAPSHOT_BRANCH = "audit-snapshots"
+SNAPSHOT_FILE = "data/real_podcast_audits.sqlite"
+MAX_PUBLISHED_SNAPSHOT_BYTES = 50 * 1024 * 1024
 MAX_DETAIL_ROWS = 5000
 
 _REQUIRED_COLUMNS = {
@@ -33,23 +40,91 @@ class DashboardDataError(RuntimeError):
     """Safe, user-facing database unavailable/schema error."""
 
 
-@contextmanager
-def _read_connection(database_path: str | Path) -> Iterator[sqlite3.Connection]:
-    path = Path(database_path).expanduser()
-    try:
-        require_sqlite_backend(path)
-    except DatabaseConfigurationError as exc:
-        raise DashboardDataError(str(exc)) from exc
-    if not path.is_file():
+def fetch_published_snapshot(token: str) -> bytes:
+    """Fetch the versioned SQLite snapshot without exposing GitHub/API details."""
+    if not isinstance(token, str) or not token.strip():
         raise DashboardDataError(
-            "SQLite database not found. Select an existing database or run an audit first; the dashboard will not create one."
+            "Published audit access is not configured. Add the read-only GitHub token to app secrets."
         )
 
+    path = quote(SNAPSHOT_FILE, safe="/")
+    url = f"https://api.github.com/repos/{SNAPSHOT_OWNER}/{SNAPSHOT_REPOSITORY}/contents/{path}"
+    headers = {
+        "Accept": "application/vnd.github.raw+json",
+        "Authorization": f"Bearer {token.strip()}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    response = None
+    try:
+        response = requests.get(
+            url, headers=headers, params={"ref": SNAPSHOT_BRANCH},
+            timeout=(5, 30), stream=True, allow_redirects=False,
+        )
+        if response.status_code == 404:
+            raise DashboardDataError(
+                "The published audit snapshot is unavailable. Run the audit workflow and check the read-only GitHub access setting."
+            )
+        if response.status_code != 200:
+            raise DashboardDataError(
+                "The published audit snapshot could not be read. Check the read-only GitHub access setting."
+            )
+
+        declared_size = response.headers.get("Content-Length")
+        if declared_size:
+            try:
+                if int(declared_size) > MAX_PUBLISHED_SNAPSHOT_BYTES:
+                    raise DashboardDataError("The published audit snapshot is larger than the supported limit.")
+            except ValueError:
+                pass
+
+        chunks: list[bytes] = []
+        size = 0
+        for chunk in response.iter_content(chunk_size=64 * 1024):
+            if not chunk:
+                continue
+            size += len(chunk)
+            if size > MAX_PUBLISHED_SNAPSHOT_BYTES:
+                raise DashboardDataError("The published audit snapshot is larger than the supported limit.")
+            chunks.append(chunk)
+        snapshot = b"".join(chunks)
+    except DashboardDataError:
+        raise
+    except requests.RequestException as exc:
+        raise DashboardDataError(
+            "The published audit snapshot could not be reached. Try refreshing later."
+        ) from exc
+    finally:
+        if response is not None:
+            response.close()
+
+    if not snapshot.startswith(b"SQLite format 3\x00"):
+        raise DashboardDataError("The published audit snapshot is missing or invalid.")
+    return snapshot
+
+
+@contextmanager
+def _read_connection(database_path: str | Path | bytes) -> Iterator[sqlite3.Connection]:
     connection: sqlite3.Connection | None = None
     try:
-        # A file URI in read-only mode prevents Streamlit interactions from
-        # creating a missing DB or modifying stored audit history.
-        connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=5)
+        if isinstance(database_path, bytes):
+            if not database_path.startswith(b"SQLite format 3\x00"):
+                raise DashboardDataError("The published audit snapshot is missing or invalid.")
+            connection = sqlite3.connect(":memory:")
+            connection.deserialize(database_path)
+        else:
+            path = Path(database_path).expanduser()
+            try:
+                require_sqlite_backend(path)
+            except DatabaseConfigurationError as exc:
+                raise DashboardDataError(str(exc)) from exc
+            if not path.is_file():
+                raise DashboardDataError(
+                    "Real audit database not found. Run an audit first; the dashboard will not create or substitute a database."
+                )
+
+            # A file URI in read-only mode prevents Streamlit interactions from
+            # creating a missing DB or modifying stored audit history.
+            connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=5)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA query_only = ON")
         _verify_schema(connection)
@@ -92,7 +167,7 @@ def _analytics_sql(filename: str) -> str:
     return (PROJECT_ROOT / "sql" / filename).read_text(encoding="utf-8-sig")
 
 
-def get_runs(database_path: str | Path = DEFAULT_DATABASE_PATH) -> list[dict[str, Any]]:
+def get_runs(database_path: str | Path | bytes = DEFAULT_DATABASE_PATH) -> list[dict[str, Any]]:
     """Return available runs, newest first, without loading podcast rows."""
     with _read_connection(database_path) as connection:
         return _rows(connection.execute(
@@ -102,7 +177,7 @@ def get_runs(database_path: str | Path = DEFAULT_DATABASE_PATH) -> list[dict[str
         ))
 
 
-def get_history_summary(database_path: str | Path = DEFAULT_DATABASE_PATH) -> dict[str, int]:
+def get_history_summary(database_path: str | Path | bytes = DEFAULT_DATABASE_PATH) -> dict[str, int]:
     """Return total run count and processed rows across all historical runs."""
     with _read_connection(database_path) as connection:
         row = connection.execute(
@@ -111,7 +186,7 @@ def get_history_summary(database_path: str | Path = DEFAULT_DATABASE_PATH) -> di
         return dict(row)
 
 
-def get_run_summary(database_path: str | Path, audit_run_id: str) -> dict[str, Any] | None:
+def get_run_summary(database_path: str | Path | bytes, audit_run_id: str) -> dict[str, Any] | None:
     """Return row/issue/URL summary for one run; issue rates count each row once."""
     query = """
         SELECT
@@ -155,7 +230,7 @@ def get_run_summary(database_path: str | Path, audit_run_id: str) -> dict[str, A
         return result
 
 
-def get_issue_counts(database_path: str | Path, audit_run_id: str) -> list[dict[str, Any]]:
+def get_issue_counts(database_path: str | Path | bytes, audit_run_id: str) -> list[dict[str, Any]]:
     """Count validation issue occurrences by category and severity for a run."""
     query = """
         SELECT category, severity, COUNT(*) AS issue_count,
@@ -168,7 +243,7 @@ def get_issue_counts(database_path: str | Path, audit_run_id: str) -> list[dict[
         return _rows(connection.execute(query, (audit_run_id,)))
 
 
-def get_issue_field_counts(database_path: str | Path, audit_run_id: str) -> list[dict[str, Any]]:
+def get_issue_field_counts(database_path: str | Path | bytes, audit_run_id: str) -> list[dict[str, Any]]:
     """Count saved findings by category, field, and severity for plain-language summaries."""
     with _read_connection(database_path) as connection:
         return _rows(connection.execute(
@@ -183,7 +258,7 @@ def get_issue_field_counts(database_path: str | Path, audit_run_id: str) -> list
 
 
 def get_podcast_records(
-    database_path: str | Path,
+    database_path: str | Path | bytes,
     audit_run_id: str,
     *,
     filter_mode: str = "all",
@@ -230,7 +305,7 @@ def get_podcast_records(
         return _rows(connection.execute(query, params))
 
 
-def get_record_findings(database_path: str | Path, audit_run_id: str, record_id: int) -> list[dict[str, Any]]:
+def get_record_findings(database_path: str | Path | bytes, audit_run_id: str, record_id: int) -> list[dict[str, Any]]:
     """Return the saved findings for one record, without exposing raw JSON."""
     with _read_connection(database_path) as connection:
         return _rows(connection.execute(
@@ -242,7 +317,7 @@ def get_record_findings(database_path: str | Path, audit_run_id: str, record_id:
         ))
 
 
-def get_schema_issues(database_path: str | Path, audit_run_id: str) -> list[dict[str, Any]]:
+def get_schema_issues(database_path: str | Path | bytes, audit_run_id: str) -> list[dict[str, Any]]:
     """Return file-level validation issues not associated with an input row."""
     with _read_connection(database_path) as connection:
         return _rows(connection.execute(
@@ -254,7 +329,7 @@ def get_schema_issues(database_path: str | Path, audit_run_id: str) -> list[dict
 
 
 def get_affected_records(
-    database_path: str | Path,
+    database_path: str | Path | bytes,
     audit_run_id: str,
     *,
     issue_category: str | None = None,
@@ -298,7 +373,7 @@ def get_affected_records(
         return _rows(connection.execute(query, params))
 
 
-def get_duplicate_feed_ids(database_path: str | Path, audit_run_id: str) -> list[dict[str, Any]]:
+def get_duplicate_feed_ids(database_path: str | Path | bytes, audit_run_id: str) -> list[dict[str, Any]]:
     """Return duplicate nonblank normalized identifiers within one run."""
     identifier = "COALESCE(NULLIF(json_extract(record_json, '$.normalized.feed_id'), ''), NULLIF(TRIM(feed_id), ''))"
     query = f"""
@@ -314,7 +389,7 @@ def get_duplicate_feed_ids(database_path: str | Path, audit_run_id: str) -> list
         return _rows(connection.execute(query, (audit_run_id,)))
 
 
-def get_issue_categories(database_path: str | Path, audit_run_id: str) -> list[str]:
+def get_issue_categories(database_path: str | Path | bytes, audit_run_id: str) -> list[str]:
     with _read_connection(database_path) as connection:
         return [row[0] for row in connection.execute(
             """SELECT DISTINCT category FROM data_quality_issues
@@ -323,7 +398,7 @@ def get_issue_categories(database_path: str | Path, audit_run_id: str) -> list[s
         )]
 
 
-def get_url_outcomes(database_path: str | Path, audit_run_id: str) -> list[dict[str, Any]]:
+def get_url_outcomes(database_path: str | Path | bytes, audit_run_id: str) -> list[dict[str, Any]]:
     query = """
         SELECT classification, COUNT(*) AS record_count,
                ROUND(100.0 * COUNT(*) / NULLIF(SUM(COUNT(*)) OVER (), 0), 2) AS checked_pct
@@ -334,7 +409,7 @@ def get_url_outcomes(database_path: str | Path, audit_run_id: str) -> list[dict[
         return _rows(connection.execute(query, (audit_run_id,)))
 
 
-def get_http_status_distribution(database_path: str | Path, audit_run_id: str) -> list[dict[str, Any]]:
+def get_http_status_distribution(database_path: str | Path | bytes, audit_run_id: str) -> list[dict[str, Any]]:
     query = """
         SELECT COALESCE(CAST(http_status_code AS TEXT), 'no_http_response') AS status_bucket,
                COUNT(*) AS check_count,
@@ -346,7 +421,7 @@ def get_http_status_distribution(database_path: str | Path, audit_run_id: str) -
         return _rows(connection.execute(query, (audit_run_id,)))
 
 
-def get_redirect_summary(database_path: str | Path, audit_run_id: str) -> dict[str, Any]:
+def get_redirect_summary(database_path: str | Path | bytes, audit_run_id: str) -> dict[str, Any]:
     query = """
         SELECT COUNT(*) AS checked_records,
                COALESCE(SUM(CASE WHEN COALESCE(json_array_length(result_json, '$.redirect_chain'), 0) > 0
@@ -361,7 +436,7 @@ def get_redirect_summary(database_path: str | Path, audit_run_id: str) -> dict[s
         return dict(connection.execute(query, (audit_run_id,)).fetchone())
 
 
-def get_redirect_destinations(database_path: str | Path, audit_run_id: str) -> list[dict[str, Any]]:
+def get_redirect_destinations(database_path: str | Path | bytes, audit_run_id: str) -> list[dict[str, Any]]:
     query = """
         SELECT json_extract(hop.value, '$.destination_url') AS destination_url,
                COUNT(*) AS observed_hops
@@ -374,7 +449,7 @@ def get_redirect_destinations(database_path: str | Path, audit_run_id: str) -> l
 
 
 def get_url_check_rows(
-    database_path: str | Path,
+    database_path: str | Path | bytes,
     audit_run_id: str,
     *,
     classification: str | None = None,
@@ -409,12 +484,12 @@ def get_url_check_rows(
         return _rows(connection.execute(query, params))
 
 
-def get_history_metrics(database_path: str | Path) -> list[dict[str, Any]]:
+def get_history_metrics(database_path: str | Path | bytes) -> list[dict[str, Any]]:
     with _read_connection(database_path) as connection:
         return _rows(connection.execute(_analytics_sql("audit_run_comparison.sql")))
 
 
-def get_url_outcome_trends(database_path: str | Path) -> list[dict[str, Any]]:
+def get_url_outcome_trends(database_path: str | Path | bytes) -> list[dict[str, Any]]:
     with _read_connection(database_path) as connection:
         return _rows(connection.execute(_analytics_sql("url_outcomes_over_time.sql")))
 
@@ -440,7 +515,7 @@ def _comparison_record(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def compare_runs(
-    database_path: str | Path,
+    database_path: str | Path | bytes,
     earlier_run_id: str,
     later_run_id: str,
 ) -> dict[str, Any]:

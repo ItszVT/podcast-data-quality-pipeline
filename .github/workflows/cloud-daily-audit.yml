@@ -1,0 +1,136 @@
+name: Publish daily podcast audit
+
+on:
+  schedule:
+    - cron: "17 13 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-daily-podcast-audit
+  cancel-in-progress: false
+
+jobs:
+  audit-and-publish:
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      SNAPSHOT_BRANCH: audit-snapshots
+      SNAPSHOT_FILE: data/real_podcast_audits.sqlite
+
+    steps:
+      - name: Check out pipeline source
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pipeline dependencies
+        run: >-
+          python -m pip install
+          --disable-pip-version-check
+          --no-input
+          -r requirements.txt
+
+      - name: Restore the previous published snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! remote_ref="$(git ls-remote --heads origin "refs/heads/${SNAPSHOT_BRANCH}")"; then
+            echo "Could not inspect the audit snapshot branch; no audit was started."
+            exit 1
+          fi
+
+          if [[ -n "$remote_ref" ]]; then
+            snapshot_sha="${remote_ref%%$'\t'*}"
+            git fetch --no-tags origin "refs/heads/${SNAPSHOT_BRANCH}:refs/remotes/origin/${SNAPSHOT_BRANCH}"
+            mapfile -t tracked_files < <(git ls-tree -r --name-only "origin/${SNAPSHOT_BRANCH}")
+            if [[ "${#tracked_files[@]}" -ne 1 || "${tracked_files[0]}" != "$SNAPSHOT_FILE" ]]; then
+              echo "The audit snapshot branch contains unexpected files; refusing to restore or publish."
+              exit 1
+            fi
+            if ! git show "${snapshot_sha}:${SNAPSHOT_FILE}" > "$RUNNER_TEMP/restored-audits.sqlite"; then
+              echo "The previous audit snapshot could not be restored."
+              exit 1
+            fi
+            mkdir -p data
+            cp "$RUNNER_TEMP/restored-audits.sqlite" "$SNAPSHOT_FILE"
+            echo "Previous audit history restored."
+          else
+            snapshot_sha=""
+            echo "No previous audit snapshot exists; the first run will initialize history."
+          fi
+
+          echo "SNAPSHOT_BASE_SHA=${snapshot_sha}" >> "$GITHUB_ENV"
+
+      - name: Run and validate the real audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! python -m src.daily_pipeline --database "$SNAPSHOT_FILE" > "$RUNNER_TEMP/audit-output.json" 2>&1; then
+            echo "The real audit did not complete successfully; snapshot publication was skipped."
+            exit 1
+          fi
+          if ! python - <<'PY'
+          from src.published_snapshot import validate_publishable_snapshot
+
+          validate_publishable_snapshot("data/real_podcast_audits.sqlite")
+          PY
+          then
+            echo "The latest real audit was not eligible for publication."
+            exit 1
+          fi
+          echo "The latest nonempty real audit passed validation and SQLite integrity checks."
+
+      - name: Publish only the SQLite snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp "$SNAPSHOT_FILE" "$RUNNER_TEMP/publish-audits.sqlite"
+
+          if ! remote_ref="$(git ls-remote --heads origin "refs/heads/${SNAPSHOT_BRANCH}")"; then
+            echo "Could not verify the audit snapshot branch; publication was skipped."
+            exit 1
+          fi
+          current_sha=""
+          if [[ -n "$remote_ref" ]]; then
+            current_sha="${remote_ref%%$'\t'*}"
+          fi
+          if [[ "$current_sha" != "$SNAPSHOT_BASE_SHA" ]]; then
+            echo "The audit snapshot branch changed during collection; refusing to overwrite it."
+            exit 1
+          fi
+
+          rm -f -- "$SNAPSHOT_FILE"
+          if [[ -n "$SNAPSHOT_BASE_SHA" ]]; then
+            git checkout --force -B "$SNAPSHOT_BRANCH" "origin/$SNAPSHOT_BRANCH"
+            mapfile -t tracked_files < <(git ls-files)
+            if [[ "${#tracked_files[@]}" -ne 1 || "${tracked_files[0]}" != "$SNAPSHOT_FILE" ]]; then
+              echo "The audit snapshot branch contains unexpected files; publication was skipped."
+              exit 1
+            fi
+          else
+            git checkout --orphan "$SNAPSHOT_BRANCH"
+          fi
+
+          mkdir -p "$(dirname "$SNAPSHOT_FILE")"
+          cp "$RUNNER_TEMP/publish-audits.sqlite" "$SNAPSHOT_FILE"
+          git add -f -- "$SNAPSHOT_FILE"
+          mapfile -t staged_files < <(git diff --cached --name-only)
+          if [[ "${#staged_files[@]}" -ne 1 || "${staged_files[0]}" != "$SNAPSHOT_FILE" ]]; then
+            echo "The staged publication is not limited to the SQLite snapshot; refusing to commit."
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Update published podcast audit snapshot"
+          git push origin "HEAD:refs/heads/${SNAPSHOT_BRANCH}"

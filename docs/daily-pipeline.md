@@ -50,6 +50,6 @@ Each saved snapshot and its podcast rows, validation issues, and URL results are
 
 Every normal invocation creates a new append-only snapshot, even when it finds the same podcasts. It never removes records from prior runs, merges similar shows, or interprets an absent show as removed. This is intentional because Apple search results can be partial or change between runs.
 
-To make a manual retry safe, supply the same --run-id as the attempted execution. If a snapshot with that ID already exists, the runner refuses before collecting, so it cannot create a duplicate snapshot. A persisted failed run also reserves its ID; use a new ID to record a later attempt. Automatic retries and Task Scheduler configuration are not implemented in this step.
+To make a manual retry safe, supply the same --run-id as the attempted execution. If a snapshot with that ID already exists, the runner refuses before collecting, so it cannot create a duplicate snapshot. A persisted failed run also reserves its ID; use a new ID to record a later attempt. The scheduled GitHub Actions publication workflow is described in [cloud-mvp-deployment.md](cloud-mvp-deployment.md).
 
 The existing audit runner remains available for local CSV/XLSX workflows, including data/sample_podcasts.csv; it is not replaced by this collection entry point.

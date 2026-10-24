@@ -2,12 +2,12 @@
 from __future__ import annotations
 
 from importlib import reload
-from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
 from src import dashboard_data as data
+from src.published_snapshot import SnapshotValidationError, validate_publishable_snapshot
 
 # The database access module is project code; reload it with the app so changes
 # to its read-only queries are available after Streamlit hot reloads this file.
@@ -59,6 +59,20 @@ CLASSIFICATION_LABELS = {
     "invalid_input": "Could not check this link",
 }
 STATUS_LABELS = {"succeeded": "Completed", "partial": "Partially completed", "failed": "Failed", "running": "In progress"}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_published_snapshot() -> bytes:
+    settings = st.secrets.get("github_snapshot", {})
+    token = settings.get("token", "") if hasattr(settings, "get") else ""
+    snapshot = data.fetch_published_snapshot(token)
+    try:
+        validate_publishable_snapshot(snapshot)
+    except SnapshotValidationError as exc:
+        raise data.DashboardDataError(
+            "The published snapshot does not contain a verified, nonempty real audit. Run the audit workflow again."
+        ) from exc
+    return snapshot
 
 
 def _audit_date(value: str | None) -> str:
@@ -116,7 +130,7 @@ def _show_records_table(records: list[dict], *, key_prefix: str = "records") -> 
     )
 
 
-def _render_findings(database_path: str, run_id: str) -> list[dict]:
+def _render_findings(database_path: str | bytes, run_id: str) -> list[dict]:
     findings = data.get_issue_field_counts(database_path, run_id)
     if not findings:
         st.success("No data quality findings were saved for this audit.", icon=":material/check_circle:")
@@ -165,9 +179,30 @@ def _render_findings(database_path: str, run_id: str) -> list[dict]:
 
 with st.sidebar:
     st.markdown("### Podcast data")
-    db_path = st.text_input("Existing audit database", value=str(data.DEFAULT_DATABASE_PATH), key="database_path")
+    dashboard_settings = st.secrets.get("dashboard", {})
+    dashboard_mode = dashboard_settings.get("mode", "local") if hasattr(dashboard_settings, "get") else "local"
+    dashboard_mode = str(dashboard_mode).strip().lower()
+    if dashboard_mode not in {"local", "published"}:
+        st.error("Dashboard mode is invalid. Set it to `local` or `published` in app settings.")
+        st.stop()
+
+    if dashboard_mode == "published":
+        try:
+            db_path = _load_published_snapshot()
+        except data.DashboardDataError as exc:
+            st.error(str(exc), icon=":material/database_off:")
+            st.stop()
+        st.caption("Latest published real audit · read-only")
+    else:
+        db_path = st.text_input(
+            "Existing audit database",
+            value="data/real_podcast_audits.sqlite",
+            key="database_path",
+        )
     st.caption("Read-only view. Opening this page never changes saved audits or checks websites.")
     if st.button("Refresh saved data", width="stretch", key="refresh_data"):
+        if dashboard_mode == "published":
+            _load_published_snapshot.clear()
         st.rerun()
     section = st.radio("Explore", SECTIONS, key="dashboard_section")
     try:
@@ -176,7 +211,10 @@ with st.sidebar:
         st.error(str(exc), icon=":material/database_off:")
         st.stop()
     if not runs:
-        st.info("This database has no saved audits yet.")
+        if dashboard_mode == "published":
+            st.error("The published snapshot contains no real audit data. Run the audit workflow first.")
+        else:
+            st.info("This database has no saved audits yet.")
         st.stop()
     run_labels = {
         row["audit_run_id"]: f"{_audit_date(row['started_at'])} · {row['input_filename']} · {STATUS_LABELS.get(row['run_status'], row['run_status'])}"
