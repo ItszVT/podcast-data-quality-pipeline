@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -28,6 +29,21 @@ def successful_collection(*_args, **_kwargs) -> CollectionResult:
     return CollectionResult(
         records=(record("itunes:collection:1"),),
         report={"api_search_errors": [], "rss_retrieval_failures": 0},
+    )
+
+
+def rss_partial_collection(*_args, **_kwargs) -> CollectionResult:
+    records = tuple(record(f"itunes:collection:{index}") for index in range(10))
+    return CollectionResult(
+        records=records,
+        report={
+            "api_search_errors": [],
+            "rss_errors": ["itunes:collection:10: Request failed (Timeout)."],
+            "rss_retrieval_successes": 9,
+            "rss_retrieval_failures": 1,
+            "missing_rss_feed_urls": 0,
+            "unique_records_retained": 10,
+        },
     )
 
 
@@ -65,7 +81,7 @@ def test_empty_or_failed_latest_run_is_not_publishable(tmp_path: Path):
         ),
         audit_run_id="empty-run",
     )
-    with pytest.raises(SnapshotValidationError, match="successful nonempty"):
+    with pytest.raises(SnapshotValidationError, match="completed nonempty"):
         validate_publishable_snapshot(empty_database)
 
     failed_database = tmp_path / "failed.sqlite"
@@ -77,8 +93,106 @@ def test_empty_or_failed_latest_run_is_not_publishable(tmp_path: Path):
         ),
         audit_run_id="partial-run",
     )
-    with pytest.raises(SnapshotValidationError, match="successful nonempty"):
+    with pytest.raises(SnapshotValidationError, match="eligible RSS-only partial"):
         validate_publishable_snapshot(failed_database)
+
+
+def test_isolated_rss_partial_audit_is_persisted_and_publishable(tmp_path: Path):
+    database = tmp_path / "rss-partial.sqlite"
+    result = run_daily_pipeline(
+        database, collector=rss_partial_collection, audit_run_id="rss-partial-run"
+    )
+
+    assert result.pipeline_status == "partial"
+    assert result.collection_status == "partial"
+    assert result.validation_status == "succeeded"
+    assert result.persistence_status == "succeeded"
+    assert result.records_collected == result.records_validated == result.records_stored == 10
+    with sqlite3.connect(database) as connection:
+        run_status, metadata_json = connection.execute(
+            "SELECT run_status, metadata_json FROM audit_runs WHERE audit_run_id = ?",
+            ("rss-partial-run",),
+        ).fetchone()
+    metadata = json.loads(metadata_json)
+    assert run_status == "partial"
+    assert metadata["collection_report"]["rss_retrieval_failures"] == 1
+    with pytest.raises(SnapshotValidationError, match="eligible RSS-only partial"):
+        validate_publishable_snapshot(database)
+    validate_publishable_snapshot(database, allow_recoverable_rss_partial=True)
+    assert dashboard_data.get_run_summary(database, "rss-partial-run")["rss_retrieval_failures"] == 1
+
+
+@pytest.mark.parametrize(
+    ("record_count", "rss_successes", "rss_failures", "api_errors"),
+    [
+        (10, 9, 1, ["one search term failed"]),  # API search was not complete.
+        (10, 0, 10, []),  # Every RSS request failed, indicating systemic trouble.
+        (9, 8, 1, []),  # Below the meaningful minimum collection size.
+    ],
+)
+def test_nonrecoverable_partial_audits_are_not_publishable(
+    tmp_path: Path, record_count: int, rss_successes: int, rss_failures: int, api_errors: list[str]
+):
+    database = tmp_path / f"ineligible-{record_count}-{rss_successes}.sqlite"
+    records = tuple(record(f"itunes:collection:{index}") for index in range(record_count))
+    collection_result = CollectionResult(
+        records=records,
+        report={
+            "api_search_errors": api_errors,
+            "rss_errors": [f"feed-{index}: timeout" for index in range(rss_failures)],
+            "rss_retrieval_successes": rss_successes,
+            "rss_retrieval_failures": rss_failures,
+            "missing_rss_feed_urls": 0,
+            "unique_records_retained": record_count,
+        },
+    )
+    result = run_daily_pipeline(
+        database, collector=lambda *_args, **_kwargs: collection_result, audit_run_id="partial-run"
+    )
+    assert result.pipeline_status == "partial"
+    with pytest.raises(SnapshotValidationError, match="eligible RSS-only partial"):
+        validate_publishable_snapshot(database, allow_recoverable_rss_partial=True)
+
+
+@pytest.mark.parametrize("failure_stage", ["collection", "validation", "persistence"])
+def test_genuinely_failed_audits_are_not_publishable(tmp_path: Path, failure_stage: str):
+    database = tmp_path / f"failed-{failure_stage}.sqlite"
+
+    def collect(*_args, **_kwargs):
+        if failure_stage == "collection":
+            raise RuntimeError("controlled systemic collection failure")
+        return rss_partial_collection()
+
+    def validate(*_args, **_kwargs):
+        if failure_stage == "validation":
+            raise ValueError("controlled validation failure")
+        from src.validation import validate_records
+
+        return validate_records(*_args, **_kwargs)
+
+    def persist(*args, **kwargs):
+        if failure_stage == "persistence":
+            raise RuntimeError("controlled persistence failure")
+        from src.database import persist_audit_run
+
+        return persist_audit_run(*args, **kwargs)
+
+    run_daily_pipeline(
+        database,
+        collector=collect,
+        validator=validate,
+        persister=persist,
+        audit_run_id=f"failed-{failure_stage}",
+    )
+    with pytest.raises(SnapshotValidationError):
+        validate_publishable_snapshot(database, allow_recoverable_rss_partial=True)
+
+
+def test_corrupt_database_is_not_publishable(tmp_path: Path):
+    database = tmp_path / "corrupt.sqlite"
+    database.write_bytes(b"not a SQLite database")
+    with pytest.raises(SnapshotValidationError):
+        validate_publishable_snapshot(database, allow_recoverable_rss_partial=True)
 
 
 def test_dashboard_reads_remote_snapshot_bytes_without_modifying_database(tmp_path: Path):

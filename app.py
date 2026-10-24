@@ -67,7 +67,7 @@ def _load_published_snapshot() -> bytes:
     token = settings.get("token", "") if hasattr(settings, "get") else ""
     snapshot = data.fetch_published_snapshot(token)
     try:
-        validate_publishable_snapshot(snapshot)
+        validate_publishable_snapshot(snapshot, allow_recoverable_rss_partial=True)
     except SnapshotValidationError as exc:
         raise data.DashboardDataError(
             "The published snapshot does not contain a verified, nonempty real audit. Run the audit workflow again."
@@ -239,6 +239,19 @@ status = STATUS_LABELS.get(summary["run_status"], summary["run_status"].replace(
 status_color = {"Completed": "green", "Partially completed": "orange", "Failed": "red", "In progress": "blue"}.get(status, "gray")
 st.badge(f"Audit status · {status}", color=status_color, help="Status saved by the audit process.")
 st.caption(f"File reviewed: {summary['input_filename']} · Audit date: {_audit_date(summary['started_at'])} · Saved snapshot, shown read-only")
+if summary["run_status"] == "partial":
+    rss_failures = summary.get("rss_retrieval_failures")
+    if isinstance(rss_failures, int) and rss_failures > 0:
+        st.warning(
+            f"RSS metadata could not be fetched for {rss_failures} podcast feed(s). "
+            "Records returned by successful searches were retained, validated, and saved; "
+            "this audit remains marked partially completed."
+        )
+    else:
+        st.warning(
+            "This audit is partially completed. Some collection requests failed, so "
+            "the saved results may not include the full search coverage."
+        )
 
 if section == "Overview":
     st.subheader("At a glance")

@@ -25,6 +25,8 @@ def test_dashboard_is_read_only_and_does_not_call_website_checker():
     assert "requests" not in imported_modules
     assert "get_url_outcomes(db_path, selected_run)" in source
     assert "No websites checked yet" in source
+    assert "RSS metadata could not be fetched" in source
+    assert 'summary["run_status"] == "partial"' in source
 
 
 def test_selected_database_views_are_read_only_and_empty_checks_are_not_failures(tmp_path):

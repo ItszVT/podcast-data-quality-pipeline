@@ -75,7 +75,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if ! python -m src.daily_pipeline --database "$SNAPSHOT_FILE" > "$RUNNER_TEMP/audit-output.json" 2>&1; then
+          print_sanitized_pipeline_summary() {
             python - "$RUNNER_TEMP/audit-output.json" <<'PY'
           import json
           import sys
@@ -119,27 +119,76 @@ jobs:
                   categories.append("persistence")
               if not categories:
                   categories.append("cli_or_runtime")
-              details = ", ".join(f"{key}={value}" for key, value in statuses.items())
+              counts = {}
+              for name in ("records_collected", "records_validated", "records_stored"):
+                  value = result.get(name)
+                  if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                      counts[name] = value
+              report = result.get("collection_report")
+              if isinstance(report, dict):
+                  for name in (
+                      "rss_retrieval_successes", "rss_retrieval_failures",
+                      "missing_rss_feed_urls", "unique_records_retained",
+                  ):
+                      value = report.get(name)
+                      if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                          counts[name] = value
+                  api_errors = report.get("api_search_errors")
+                  if isinstance(api_errors, list):
+                      counts["api_search_error_count"] = len(api_errors)
+              details = ", ".join(
+                  [f"{key}={value}" for key, value in statuses.items()]
+                  + [f"{key}={value}" for key, value in counts.items()]
+              )
               print(
-                  "Audit execution failed; "
+                  "Audit summary; "
                   f"sanitized_category={'+'.join(categories)}"
                   + (f"; {details}" if details else "")
                   + "."
               )
           PY
+          }
+
+          pipeline_exit=0
+          if python -m src.daily_pipeline --database "$SNAPSHOT_FILE" > "$RUNNER_TEMP/audit-output.json" 2>&1; then
+            pipeline_exit=0
+          else
+            pipeline_exit=$?
+          fi
+
+          allow_recoverable_rss_partial=false
+          if [[ "$pipeline_exit" -eq 2 ]]; then
+            allow_recoverable_rss_partial=true
+          elif [[ "$pipeline_exit" -ne 0 ]]; then
+            print_sanitized_pipeline_summary
             echo "The real audit did not complete successfully; snapshot publication was skipped."
             exit 1
           fi
-          if ! python - <<'PY'
+
+          if ! python - "$SNAPSHOT_FILE" "$allow_recoverable_rss_partial" <<'PY'
+          import sys
           from src.published_snapshot import validate_publishable_snapshot
 
-          validate_publishable_snapshot("data/real_podcast_audits.sqlite")
+          try:
+              validate_publishable_snapshot(
+                  sys.argv[1], allow_recoverable_rss_partial=sys.argv[2] == "true"
+              )
+          except Exception:
+              print("Snapshot validation failed.", file=sys.stderr)
+              sys.exit(1)
           PY
           then
-            echo "The latest real audit was not eligible for publication."
+            print_sanitized_pipeline_summary
+            echo "The audit did not meet publication eligibility requirements; snapshot publication was skipped."
             exit 1
           fi
-          echo "The latest nonempty real audit passed validation and SQLite integrity checks."
+
+          if [[ "$allow_recoverable_rss_partial" == "true" ]]; then
+            print_sanitized_pipeline_summary
+            echo "The audit remains partial; isolated RSS failures passed the publication eligibility checks."
+          else
+            echo "The latest nonempty real audit passed validation and SQLite integrity checks."
+          fi
 
       - name: Publish only the SQLite snapshot
         shell: bash

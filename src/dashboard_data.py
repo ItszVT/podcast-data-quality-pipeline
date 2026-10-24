@@ -196,6 +196,7 @@ def get_run_summary(database_path: str | Path | bytes, audit_run_id: str) -> dic
             ar.started_at,
             ar.completed_at,
             ar.records_processed,
+            ar.metadata_json,
             (SELECT COUNT(*) FROM podcast_records p
              WHERE p.audit_run_id = ar.audit_run_id) AS stored_records,
             (SELECT COUNT(*) FROM podcast_records p
@@ -220,6 +221,17 @@ def get_run_summary(database_path: str | Path | bytes, audit_run_id: str) -> dic
         if row is None:
             return None
         result = dict(row)
+        try:
+            metadata = json.loads(result.pop("metadata_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            metadata = {}
+        collection_report = metadata.get("collection_report") if isinstance(metadata, dict) else None
+        rss_failures = collection_report.get("rss_retrieval_failures") if isinstance(collection_report, dict) else None
+        result["rss_retrieval_failures"] = (
+            rss_failures
+            if isinstance(rss_failures, int) and not isinstance(rss_failures, bool) and rss_failures >= 0
+            else None
+        )
         stored = result["stored_records"]
         result["records_with_issues_pct"] = (
             round(100.0 * result["records_with_issues"] / stored, 2) if stored else None
