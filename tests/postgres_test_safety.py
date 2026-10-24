@@ -25,9 +25,9 @@ class DatabaseTestSafetyError(ValueError):
 @dataclass(frozen=True)
 class TestDatabaseTarget:
     url: str = field(repr=False)
-    hostname: str
-    database: str
-    username: str | None
+    hostname: str = field(repr=False)
+    database: str = field(repr=False)
+    username: str | None = field(repr=False)
     remote: bool
 
 

@@ -7,6 +7,7 @@ import types
 import pytest
 
 import test_postgres_integration as postgres_integration
+from postgres_tls_probe import classify_openssl_result, run_postgres_tls_probe
 
 from postgres_test_safety import (
     DATABASE_URL,
@@ -165,6 +166,20 @@ def test_configuration_errors_never_echo_credentials_or_full_url():
     assert secret_url not in str(error.value)
 
 
+def test_target_repr_omits_url_and_connection_identity():
+    target = resolve_test_target(remote_env())
+    rendered = repr(target)
+
+    for sensitive_value in (
+        "unit.neon.tech",
+        "podcast_test",
+        "pipeline_test",
+        "secret",
+        "postgresql://",
+    ):
+        assert sensitive_value not in rendered
+
+
 @pytest.mark.parametrize(
     "error, expected",
     [
@@ -234,6 +249,48 @@ def test_remote_connection_requires_libpq_16_for_system_ca_support():
     with pytest.raises(DatabaseTestSafetyError, match="libpq 16 or newer"):
         open_verified_connection(FakePsycopg, target)
     assert called == []
+
+
+@pytest.mark.parametrize(
+    "output, returncode, expected",
+    [
+        ("verify error:num=20:unable to get local issuer certificate", 1, "certificate_chain_failure"),
+        ("verify error:num=62:hostname mismatch", 1, "hostname_mismatch"),
+        ("verify error:num=10:certificate has expired", 1, "certificate_expiry_or_validity_failure"),
+        ("Verify return code: 0 (ok)", 0, "system_openssl_verification_passed"),
+        ("SSL handshake failed for private.example", 1, "unsupported_or_noncertificate_failure"),
+    ],
+)
+def test_openssl_probe_categories_are_fixed_and_sanitized(output, returncode, expected):
+    category = classify_openssl_result(output, returncode)
+    assert category == expected
+    assert "private.example" not in category
+    assert category in {
+        "certificate_chain_failure",
+        "certificate_expiry_or_validity_failure",
+        "hostname_mismatch",
+        "system_openssl_verification_passed",
+        "unsupported_or_noncertificate_failure",
+    }
+
+
+def test_openssl_probe_uses_postgres_starttls_and_hostname_verification():
+    seen = {}
+
+    def fake_run(command, **kwargs):
+        seen["command"] = command
+        seen["kwargs"] = kwargs
+        return types.SimpleNamespace(returncode=0, stdout="Verify return code: 0 (ok)", stderr="")
+
+    category = run_postgres_tls_probe("safe-host.invalid", 5432, run=fake_run)
+
+    assert category == "system_openssl_verification_passed"
+    assert seen["command"][1:5] == ["s_client", "-starttls", "postgres", "-connect"]
+    assert "-verify_hostname" in seen["command"]
+    assert "-verify_return_error" in seen["command"]
+    assert "-CAfile" in seen["command"]
+    assert seen["kwargs"]["capture_output"] is True
+    assert seen["kwargs"]["timeout"] == 15
 
 
 def test_cleanup_refuses_to_drop_schema_other_than_fixture_owned_name():
