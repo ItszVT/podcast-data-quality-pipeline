@@ -25,12 +25,30 @@ def test_dashboard_is_read_only_and_does_not_call_website_checker():
     assert "requests" not in imported_modules
     assert "get_url_outcomes(db_path, selected_run)" in source
     assert "No websites checked yet" in source
+    assert "except StreamlitSecretNotFoundError" in source
+    assert 'dashboard_mode = dashboard_settings.get("mode", "local")' in source
+    assert 'key_prefix="quality_errors"' in source
+    assert 'key_prefix="quality_completeness"' in source
+    assert 'key_prefix="quality_warnings"' in source
+    assert 'key_prefix="quality_information"' in source
+    assert 'Audit history with execution status, sample size, and error rate' in source
+    assert 'Open an audit below for its source, finding counts, website results, and full ID.' in source
+    assert '"Value": str(row["stored_records"])' in source
     assert "RSS metadata could not be fetched" in source
     assert 'summary["run_status"] == "partial"' in source
     assert 'summary.get("website_check_status") == "partial"' in source
-    assert "Website checking completed partially" in source
-    geo_start = source.index('elif section == "Geo Intelligence":')
-    geo_end = source.index('elif section == "Audit history":', geo_start)
+    assert "Website checking was partial" in source
+    assert 'summary.get("website_check_status", "unknown")' in source
+    assert 'Audit ID: `{summary[\'audit_run_id\']}`' in source
+    assert 'SECTIONS = ["Overview", "Data quality", "Website health", "Geo intelligence", "Podcast records", "History"]' in source
+    assert 'with st.expander("Methodology / About these checks")' in source
+    assert '"Records with actionable errors"' in source
+    assert '"Completeness notes"' in source
+    assert 'st.subheader("Confirmed changes")' in source
+    assert 'row.get("change_classification") == "first_observation"' in source
+    assert 'frame[frame["run_status"].isin({"succeeded", "partial"})]' in source
+    geo_start = source.index('elif section == "Geo intelligence":')
+    geo_end = source.index('elif section == "History":', geo_start)
     geo_section = source[geo_start:geo_end]
     assert 'metric("Podcasts analyzed"' in geo_section
     assert 'metric("RSS checked"' in geo_section
@@ -51,6 +69,11 @@ def test_selected_database_views_are_read_only_and_empty_checks_are_not_failures
     persist_audit_run(database, "one.csv", [record], audit_run_id="one")
     before = database.read_bytes()
     assert dashboard_data.get_url_outcomes(database, "one") == []
-    assert dashboard_data.get_run_summary(database, "one")["url_check_count"] == 0
+    summary = dashboard_data.get_run_summary(database, "one")
+    assert summary["url_check_count"] == 0
+    assert summary["website_check_status"] == "unknown"
+    assert summary["records_with_actionable_errors"] == 0
+    assert summary["completeness_issue_occurrences"] == 1
+    assert dashboard_data.get_geo_intelligence(database, "one") == {}
     assert len(dashboard_data.get_podcast_records(database, "one", filter_mode="with_findings")) == 1
     assert database.read_bytes() == before

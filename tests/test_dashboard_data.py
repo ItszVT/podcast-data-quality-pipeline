@@ -69,6 +69,10 @@ def test_run_views_count_rows_issues_missing_urls_and_url_outcomes(database_path
     assert summary["stored_records"] == 3
     assert summary["records_with_issues"] == 2
     assert summary["issue_occurrences"] == 3
+    assert summary["actionable_issue_occurrences"] == 2
+    assert summary["records_with_actionable_errors"] == 2
+    assert summary["completeness_issue_occurrences"] == 1
+    assert summary["informational_issue_occurrences"] == 0
     assert summary["records_with_issues_pct"] == pytest.approx(66.67)
     assert summary["missing_website_urls"] == 2
     issue_rows = dashboard.get_issue_counts(database_path, "run-1")
@@ -114,7 +118,9 @@ def test_multiple_run_comparison_only_matches_unique_identifiers_and_checked_pai
     assert comparison["ambiguous_identifiers"][0]["feed_id"] == "ambiguous"
     assert comparison["unidentified_records"]
     assert next(item for item in comparison["present_in_both"] if item["feed_id"] == "unchecked")["url_outcome_status"] == "not_checked_in_both"
-    assert len(dashboard.get_history_metrics(database_path)) == 2
+    history_rows = dashboard.get_history_metrics(database_path)
+    assert len(history_rows) == 2
+    assert {"actionable_error_rate_pct", "records_with_actionable_errors", "completeness_issue_occurrences", "other_warning_occurrences"}.issubset(history_rows[0])
     assert dashboard.get_url_outcome_trends(database_path)
 
 
@@ -190,3 +196,95 @@ def test_run_summary_exposes_sanitized_website_check_stage_state(tmp_path):
     assert summary["website_check_status"] == "partial"
     assert summary["website_check_unique_urls"] == 4
     assert summary["website_check_unexpected_errors"] == 1
+
+
+def test_legacy_website_request_state_is_unknown_and_unique_urls_reconcile_to_saved_rows(tmp_path):
+    database_path = tmp_path / "legacy-website.sqlite"
+    records = [
+        record(2, "one", url="https://shared.test"),
+        record(3, "two", url="https://shared.test"),
+        record(4, "three", url="https://other.test"),
+    ]
+    persist_audit_run(
+        database_path, r"C:\private\input.csv", records,
+        audit_run_id="legacy-website",
+        url_check_results={
+            2: check("https://shared.test", LIKELY_WORKING),
+            3: check("https://shared.test", LIKELY_WORKING),
+            4: check("https://other.test", HTTP_ERROR, status=503),
+        },
+    )
+
+    summary = dashboard.get_run_summary(database_path, "legacy-website")
+    run = dashboard.get_runs(database_path)[0]
+    assert summary["website_check_status"] == "unknown"
+    assert summary["url_check_count"] == 3
+    assert summary["website_records_with_results"] == 3
+    assert summary["website_check_unique_urls"] == 2
+    assert summary["website_unique_count_source"] == "saved_results"
+    assert run["source_label"] == "input.csv"
+    assert "private" not in run["source_label"]
+
+
+def test_explicit_not_requested_website_state_remains_distinct_from_unknown(tmp_path):
+    database_path = tmp_path / "not-requested.sqlite"
+    persist_audit_run(
+        database_path, "source.csv", [record(2, "one")], audit_run_id="not-requested",
+        metadata={"website_checking": {"requested": False, "status": "not_requested"}},
+    )
+    assert dashboard.get_run_summary(database_path, "not-requested")["website_check_status"] == "not_requested"
+
+
+def test_malformed_legacy_website_metadata_fails_to_unknown_without_treating_booleans_as_counts(tmp_path):
+    database_path = tmp_path / "malformed-metadata.sqlite"
+    persist_audit_run(
+        database_path, "source.csv", [record(2, "one")], audit_run_id="malformed",
+        metadata={"website_checking": {
+            "status": ["partial"], "requested": True,
+            "unique_urls_checked": True, "unexpected_error_count": True,
+        }},
+    )
+    summary = dashboard.get_run_summary(database_path, "malformed")
+    assert summary["website_check_status"] == "unknown"
+    assert summary["website_check_unique_urls"] is None
+    assert summary["website_check_unexpected_errors"] == 0
+
+
+def test_dashboard_source_uses_collection_metadata_and_stage_statuses(tmp_path):
+    database_path = tmp_path / "source.sqlite"
+    persist_audit_run(
+        database_path, "local.csv", [record(2, "one")], audit_run_id="source",
+        metadata={
+            "collection_report": {"source": "Apple API and publisher RSS", "storefront": "US search storefront"},
+            "stages": {"preflight": "succeeded", "collection": "partial", "validation": "succeeded", "persistence": "succeeded", "unsafe": "raw-secret"},
+        },
+    )
+    summary = dashboard.get_run_summary(database_path, "source")
+    assert summary["source_label"] == "Apple API and publisher RSS"
+    assert summary["storefront_label"] == "US search storefront"
+    assert summary["execution_stages"] == {"preflight": "succeeded", "collection": "partial", "validation": "succeeded", "persistence": "succeeded"}
+
+
+def test_execution_status_and_quality_counts_are_independent_with_sample_denominators(tmp_path):
+    database_path = tmp_path / "execution-quality.sqlite"
+    records = [
+        record(2, "one", issues=(ValidationIssue("bad_url", "Invalid site.", "website_url"),)),
+        record(3, "two", issues=(ValidationIssue("missing_optional_field", "No country.", "country", "warning"),)),
+        record(4, "three", issues=(ValidationIssue("missing_optional_field", "No language.", "language", "warning"),)),
+        record(5, "four"),
+        record(6, "five", issues=(ValidationIssue("surrounding_whitespace", "Trim spaces.", "title", "warning"),)),
+    ]
+    persist_audit_run(database_path, "source.csv", records, audit_run_id="partial", run_status="partial")
+    persist_audit_run(database_path, "source.csv", records[:1], audit_run_id="failed", run_status="failed")
+
+    partial = dashboard.get_run_summary(database_path, "partial")
+    failed = dashboard.get_run_summary(database_path, "failed")
+    assert partial["run_status"] == "partial"
+    assert failed["run_status"] == "failed"
+    assert partial["records_with_actionable_errors"] == 1
+    assert partial["completeness_issue_occurrences"] == 2
+    assert partial["stored_records"] == 5
+    assert partial["other_warning_occurrences"] == 1
+    history = {row["audit_run_id"]: row for row in dashboard.get_history_metrics(database_path)}
+    assert history["partial"]["actionable_error_rate_pct"] == 20.0
+    assert history["partial"]["stored_records"] == 5

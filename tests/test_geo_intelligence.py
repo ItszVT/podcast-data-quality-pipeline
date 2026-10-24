@@ -265,3 +265,23 @@ def test_structured_location_drift_uses_history_and_missing_is_not_a_change(tmp_
     drift = {row["field"]: row for row in metadata["geo_intelligence"]["drift"]}
     assert drift["structured_creator_locations"]["change_classification"] == "unchanged"
     assert drift["structured_creator_locations"]["previous_value"] == [["CA", "toronto"]]
+
+
+def test_failed_audits_do_not_become_geographic_drift_baselines(tmp_path, monkeypatch):
+    from src.database import persist_audit_run
+    from src.validation import ValidatedRecord
+
+    monkeypatch.setattr(geo, "_country_reference", lambda: _Reference())
+    database = tmp_path / "failed-history.sqlite"
+    failed_record = _record(feed_id="itunes:failed-history", country="US")
+    persist_audit_run(
+        database, "failed.csv", [ValidatedRecord(2, failed_record, failed_record, ())],
+        audit_run_id="failed-history", run_status="failed",
+    )
+    current = _record(feed_id="itunes:failed-history", country="CA")
+    result = geo.build_geo_intelligence(
+        database, [current], {"rss_evidence_status_by_feed": {}}, "2026-10-24T12:00:00+00:00",
+    )
+    drift = next(item for item in result["drift"] if item["field"] == "declared_publisher_country")
+    assert drift["change_classification"] == "first_observation"
+    assert drift["previous_value"] is None

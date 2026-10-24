@@ -170,11 +170,17 @@ def _analytics_sql(filename: str) -> str:
 def get_runs(database_path: str | Path | bytes = DEFAULT_DATABASE_PATH) -> list[dict[str, Any]]:
     """Return available runs, newest first, without loading podcast rows."""
     with _read_connection(database_path) as connection:
-        return _rows(connection.execute(
+        rows = _rows(connection.execute(
             """SELECT audit_run_id, input_filename, run_status, started_at,
-                      completed_at, records_processed
+                      completed_at, records_processed,
+                      CASE WHEN json_valid(metadata_json)
+                           THEN json_extract(metadata_json, '$.collection_report.source')
+                           ELSE NULL END AS collection_source
                FROM audit_runs ORDER BY started_at DESC, audit_run_id DESC"""
         ))
+        for row in rows:
+            row["source_label"] = _source_label(row.get("input_filename"), row.pop("collection_source", None))
+        return rows
 
 
 def get_history_summary(database_path: str | Path | bytes = DEFAULT_DATABASE_PATH) -> dict[str, int]:
@@ -187,7 +193,7 @@ def get_history_summary(database_path: str | Path | bytes = DEFAULT_DATABASE_PAT
 
 
 def get_run_summary(database_path: str | Path | bytes, audit_run_id: str) -> dict[str, Any] | None:
-    """Return row/issue/URL summary for one run; issue rates count each row once."""
+    """Return selected-run execution, quality, coverage, and URL summaries."""
     query = """
         SELECT
             ar.audit_run_id,
@@ -207,9 +213,31 @@ def get_run_summary(database_path: str | Path | bytes, audit_run_id: str) -> dic
             (SELECT COUNT(*) FROM data_quality_issues i
              WHERE i.audit_run_id = ar.audit_run_id) AS issue_occurrences,
             (SELECT COUNT(*) FROM data_quality_issues i
+             WHERE i.audit_run_id = ar.audit_run_id AND i.severity = 'error') AS actionable_issue_occurrences,
+            (SELECT COUNT(DISTINCT i.record_id) FROM data_quality_issues i
+             WHERE i.audit_run_id = ar.audit_run_id AND i.severity = 'error'
+               AND i.record_id IS NOT NULL) AS records_with_actionable_errors,
+            (SELECT COUNT(*) FROM data_quality_issues i
+             WHERE i.audit_run_id = ar.audit_run_id AND i.category = 'missing_optional_field') AS completeness_issue_occurrences,
+            (SELECT COUNT(*) FROM data_quality_issues i
+             WHERE i.audit_run_id = ar.audit_run_id AND i.severity = 'warning'
+               AND i.category != 'missing_optional_field') AS other_warning_occurrences,
+            (SELECT COUNT(*) FROM data_quality_issues i
+             WHERE i.audit_run_id = ar.audit_run_id AND i.severity = 'info') AS informational_issue_occurrences,
+            (SELECT COUNT(DISTINCT i.record_id) FROM data_quality_issues i
+             WHERE i.audit_run_id = ar.audit_run_id AND i.category = 'missing_optional_field'
+               AND i.record_id IS NOT NULL) AS records_with_completeness_notes,
+            (SELECT COUNT(*) FROM data_quality_issues i
              WHERE i.audit_run_id = ar.audit_run_id AND i.record_id IS NULL) AS schema_issue_count,
+            (SELECT COUNT(*) FROM data_quality_issues i
+             WHERE i.audit_run_id = ar.audit_run_id AND i.record_id IS NULL
+               AND i.severity = 'error') AS file_level_error_count,
             (SELECT COUNT(*) FROM url_checks u
              WHERE u.audit_run_id = ar.audit_run_id) AS url_check_count,
+            (SELECT COUNT(DISTINCT COALESCE(NULLIF(p.normalized_website_url, ''), NULLIF(u.original_url, '')))
+             FROM url_checks u JOIN podcast_records p
+               ON p.audit_run_id = u.audit_run_id AND p.record_id = u.record_id
+             WHERE u.audit_run_id = ar.audit_run_id) AS url_unique_targets_saved,
             (SELECT COALESCE(SUM(CASE WHEN p.record_id IS NOT NULL AND
                                   (p.website_url IS NULL OR TRIM(p.website_url) = '')
                              THEN 1 ELSE 0 END), 0)
@@ -226,25 +254,44 @@ def get_run_summary(database_path: str | Path | bytes, audit_run_id: str) -> dic
         except (TypeError, json.JSONDecodeError):
             metadata = {}
         collection_report = metadata.get("collection_report") if isinstance(metadata, dict) else None
+        collection_report = collection_report if isinstance(collection_report, dict) else {}
         website = metadata.get("website_checking") if isinstance(metadata, dict) else None
         website = website if isinstance(website, dict) else {}
         website_status = website.get("status")
-        result["website_check_status"] = website_status if website_status in {"not_requested", "succeeded", "partial"} else "not_requested"
+        if isinstance(website_status, str) and website_status in {"not_requested", "succeeded", "partial"}:
+            result["website_check_status"] = website_status
+        elif website.get("requested") is False or (metadata.get("url_checks_requested") is False if isinstance(metadata, dict) else False):
+            result["website_check_status"] = "not_requested"
+        else:
+            # Older snapshots often did not persist this stage. Do not turn
+            # missing evidence into a claim that checking was not requested.
+            result["website_check_status"] = "unknown"
         result["website_check_unique_urls"] = (
             website.get("unique_urls_checked")
             if isinstance(website.get("unique_urls_checked"), int) and not isinstance(website.get("unique_urls_checked"), bool) and website.get("unique_urls_checked") >= 0
-            else 0
+            else result["url_unique_targets_saved"] if result["url_check_count"] else None
         )
-        result["website_check_unexpected_errors"] = (
-            website.get("unexpected_error_count")
-            if isinstance(website.get("unexpected_error_count"), int) and not isinstance(website.get("unexpected_error_count"), bool) and website.get("unexpected_error_count") >= 0
-            else 0
-        )
-        rss_failures = collection_report.get("rss_retrieval_failures") if isinstance(collection_report, dict) else None
+        result["website_unique_count_source"] = "pipeline_metadata" if isinstance(website.get("unique_urls_checked"), int) and not isinstance(website.get("unique_urls_checked"), bool) else "saved_results" if result["url_check_count"] else "unavailable"
+        result["website_records_with_results"] = result["url_check_count"]
+        result["website_check_unexpected_errors"] = _nonnegative_int(website.get("unexpected_error_count")) or 0
+        stop_reason = website.get("stop_reason")
+        result["website_check_stop_reason"] = stop_reason if isinstance(stop_reason, str) and stop_reason in {"unique_url_limit_reached", "stage_budget_exhausted", "checker_error"} else None
+        rss_failures = collection_report.get("rss_retrieval_failures")
         result["rss_retrieval_failures"] = (
             rss_failures
             if isinstance(rss_failures, int) and not isinstance(rss_failures, bool) and rss_failures >= 0
             else None
+        )
+        result["rss_retrieval_successes"] = _nonnegative_int(collection_report.get("rss_retrieval_successes"))
+        result["rss_feeds_missing_url"] = _nonnegative_int(collection_report.get("missing_rss_feed_urls"))
+        result["execution_stages"] = _safe_stage_statuses(metadata.get("stages") if isinstance(metadata, dict) else None)
+        result["source_label"] = _source_label(result.get("input_filename"), collection_report.get("source"))
+        geo_metadata = metadata.get("geo_intelligence") if isinstance(metadata, dict) else None
+        storefront = geo_metadata.get("storefront_context") if isinstance(geo_metadata, dict) else None
+        result["storefront_label"] = (
+            str(storefront.get("value")) if isinstance(storefront, dict) and storefront.get("value")
+            else collection_report.get("storefront") if isinstance(collection_report.get("storefront"), str) and collection_report.get("storefront")
+            else "Not recorded"
         )
         stored = result["stored_records"]
         result["records_with_issues_pct"] = (
@@ -254,6 +301,26 @@ def get_run_summary(database_path: str | Path | bytes, audit_run_id: str) -> dic
             round(100.0 * result["missing_website_urls"] / stored, 2) if stored else None
         )
         return result
+
+
+def _nonnegative_int(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _safe_stage_statuses(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    allowed = {"succeeded", "partial", "failed", "skipped", "not_requested", "not_started"}
+    return {str(name): status for name, status in value.items() if isinstance(name, str) and isinstance(status, str) and status in allowed}
+
+
+def _source_label(input_filename: Any, source: Any) -> str:
+    if isinstance(source, str) and source.strip() and "://" not in source:
+        return source.strip()[:120]
+    if isinstance(input_filename, str) and input_filename.strip():
+        # Legacy runs may have stored a local path. Expose only its basename.
+        return input_filename.strip().replace("\\", "/").rsplit("/", 1)[-1][:120]
+    return "Source not recorded"
 
 
 def get_geo_intelligence(database_path: str | Path | bytes, audit_run_id: str) -> dict[str, Any]:
@@ -310,7 +377,7 @@ def get_podcast_records(
     limit: int = 1000,
 ) -> list[dict[str, Any]]:
     """Return a bounded, filterable record list with source metadata and finding counts."""
-    allowed = {"all", "with_findings", "without_findings", "missing_website", "category"}
+    allowed = {"all", "with_findings", "without_findings", "with_actionable_errors", "with_completeness_notes", "missing_website", "category"}
     if filter_mode not in allowed:
         raise ValueError(f"Unsupported podcast record filter: {filter_mode}")
     clauses = ["p.audit_run_id = ?"]
@@ -318,6 +385,10 @@ def get_podcast_records(
     issue_exists = "EXISTS (SELECT 1 FROM data_quality_issues i WHERE i.audit_run_id=p.audit_run_id AND i.record_id=p.record_id)"
     if filter_mode == "with_findings":
         clauses.append(issue_exists)
+    elif filter_mode == "with_actionable_errors":
+        clauses.append("EXISTS (SELECT 1 FROM data_quality_issues i WHERE i.audit_run_id=p.audit_run_id AND i.record_id=p.record_id AND i.severity='error')")
+    elif filter_mode == "with_completeness_notes":
+        clauses.append("EXISTS (SELECT 1 FROM data_quality_issues i WHERE i.audit_run_id=p.audit_run_id AND i.record_id=p.record_id AND i.severity='warning')")
     elif filter_mode == "without_findings":
         clauses.append(f"NOT ({issue_exists})")
     elif filter_mode == "missing_website":
@@ -358,6 +429,31 @@ def get_record_findings(database_path: str | Path | bytes, audit_run_id: str, re
                ORDER BY severity, category, field""",
             (audit_run_id, record_id),
         ))
+
+
+def get_record_url_check(database_path: str | Path | bytes, audit_run_id: str, record_id: int) -> dict[str, Any] | None:
+    """Return one saved URL observation only when it belongs to this run and record."""
+    with _read_connection(database_path) as connection:
+        row = connection.execute(
+            """SELECT classification, http_status_code, original_url, final_url,
+                      result_json
+               FROM url_checks
+               WHERE audit_run_id=? AND record_id=?""",
+            (audit_run_id, record_id),
+        ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        try:
+            details = json.loads(result.pop("result_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            details = {}
+        result.update({
+            "redirect_chain": details.get("redirect_chain", []) if isinstance(details, dict) else [],
+            "evidence": details.get("evidence") if isinstance(details, dict) else None,
+            "error_reason": details.get("error_reason") if isinstance(details, dict) else None,
+        })
+        return result
 
 
 def get_schema_issues(database_path: str | Path | bytes, audit_run_id: str) -> list[dict[str, Any]]:

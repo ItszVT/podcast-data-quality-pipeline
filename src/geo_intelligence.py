@@ -267,7 +267,11 @@ def _historical_observations(database_path: str | Path) -> tuple[dict[str, list[
             return history, []
         uri = path.resolve().as_uri() + "?mode=ro"
         with sqlite3.connect(uri, uri=True, timeout=5) as connection:
-            runs = connection.execute("SELECT audit_run_id, started_at, metadata_json FROM audit_runs ORDER BY started_at, audit_run_id").fetchall()
+            runs = connection.execute(
+                """SELECT audit_run_id, started_at, metadata_json FROM audit_runs
+                   WHERE run_status IN ('succeeded', 'partial')
+                   ORDER BY started_at, audit_run_id"""
+            ).fetchall()
             run_times = {run[0]: run[1] for run in runs}
             for run_id, started_at, metadata_json in runs:
                 try:
