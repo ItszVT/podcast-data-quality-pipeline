@@ -219,6 +219,9 @@ jobs:
             fi
           else
             git checkout --orphan "$SNAPSHOT_BRANCH"
+            # Orphan checkout keeps the source branch's index. Clear only the
+            # index; the validated SQLite copy remains safe in RUNNER_TEMP.
+            git read-tree --empty
           fi
 
           mkdir -p "$(dirname "$SNAPSHOT_FILE")"
