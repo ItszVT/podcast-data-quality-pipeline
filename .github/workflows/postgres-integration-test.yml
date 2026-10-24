@@ -1,3 +1,4 @@
+
 name: Neon PostgreSQL integration tests
 
 on:
@@ -18,7 +19,7 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
         with:
           persist-credentials: false
 
@@ -31,61 +32,169 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
+          import ipaddress
           import os
           import re
           from urllib.parse import parse_qsl, unquote, urlsplit
 
-          def fail():
-              raise SystemExit(
-                  "PostgreSQL test target validation failed; no connection was attempted."
-              )
+          def fail(message):
+              raise SystemExit(message)
 
           database_url = os.environ.get("PODCAST_TEST_DATABASE_URL", "").strip()
-          expected_database = os.environ["PODCAST_TEST_EXPECTED_DATABASE"]
-          expected_user = os.environ["PODCAST_TEST_EXPECTED_USER"]
+
           if not database_url:
-              fail()
+              fail(
+                  "PODCAST_TEST_DATABASE_URL is missing or empty; "
+                  "no connection was attempted."
+              )
 
           try:
               parsed = urlsplit(database_url)
+          except ValueError:
+              fail(
+                  "The PostgreSQL test URL is malformed; "
+                  "no connection was attempted."
+              )
+
+          if parsed.scheme.lower() not in {"postgres", "postgresql"}:
+              fail(
+                  "The PostgreSQL test URL has an invalid scheme; "
+                  "no connection was attempted."
+              )
+
+          try:
               hostname = parsed.hostname or ""
-              parsed.port  # Validate malformed and out-of-range port syntax.
+              parsed.port
+          except ValueError:
+              fail(
+                  "The PostgreSQL test URL has an invalid host or port; "
+                  "no connection was attempted."
+              )
+
+          def valid_hostname(host):
+              candidate = host[:-1] if host.endswith(".") else host
+
+              if (
+                  not candidate
+                  or len(candidate) > 253
+                  or any(c.isspace() for c in candidate)
+              ):
+                  return False
+
+              if re.fullmatch(r"[0-9.]+", candidate):
+                  try:
+                      ipaddress.ip_address(candidate)
+                      return True
+                  except ValueError:
+                      return False
+
+              try:
+                  ipaddress.ip_address(candidate)
+                  return True
+              except ValueError:
+                  labels = candidate.split(".")
+                  return all(
+                      re.fullmatch(
+                          r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?",
+                          label
+                      )
+                      for label in labels
+                  )
+
+          if not valid_hostname(hostname):
+              fail(
+                  "The PostgreSQL test URL has a missing or invalid "
+                  "hostname; no connection was attempted."
+              )
+
+          try:
               database = unquote(parsed.path.lstrip("/"))
-              username = unquote(parsed.username) if parsed.username is not None else ""
+              username = (
+                  unquote(parsed.username)
+                  if parsed.username is not None
+                  else ""
+              )
+
               sslmodes = [
                   value
-                  for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+                  for key, value in parse_qsl(
+                      parsed.query,
+                      keep_blank_values=True
+                  )
                   if key == "sslmode"
               ]
+
           except (ValueError, UnicodeError):
-              fail()
+              fail(
+                  "The PostgreSQL test URL is malformed; "
+                  "no connection was attempted."
+              )
+
+          expected_database = os.environ[
+              "PODCAST_TEST_EXPECTED_DATABASE"
+          ]
+
+          expected_user = os.environ[
+              "PODCAST_TEST_EXPECTED_USER"
+          ]
 
           if (
-              parsed.scheme.lower() not in {"postgres", "postgresql"}
-              or not re.fullmatch(r"[A-Za-z0-9.-]+", hostname)
-              or not database
-              or not username
+              not database
               or database != expected_database
-              or username != expected_user
               or "test" not in database.casefold()
-              or sslmodes != ["verify-full"]
           ):
-              fail()
+              fail(
+                  "The PostgreSQL test URL database does not match "
+                  "the configured test database."
+              )
 
-          # Pass the validated host to the fixture through the runner environment.
-          # It is not printed or included in workflow output.
-          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as github_env:
-              github_env.write(f"PODCAST_TEST_EXPECTED_HOST={hostname.lower()}\n")
+          if not username or username != expected_user:
+              fail(
+                  "The PostgreSQL test URL username does not match "
+                  "the configured test role."
+              )
+
+          if not sslmodes:
+              fail(
+                  "The PostgreSQL test URL is missing "
+                  "sslmode=verify-full."
+              )
+
+          if len(sslmodes) != 1:
+              fail(
+                  "The PostgreSQL test URL must contain exactly "
+                  "one sslmode parameter."
+              )
+
+          if sslmodes[0] != "verify-full":
+              fail(
+                  "The PostgreSQL test URL sslmode must be "
+                  "verify-full."
+              )
+
+          # Pass the validated host to the test fixture.
+          # Never print the connection URL or host.
+          with open(
+              os.environ["GITHUB_ENV"],
+              "a",
+              encoding="utf-8"
+          ) as github_env:
+              github_env.write(
+                  f"PODCAST_TEST_EXPECTED_HOST={hostname.lower()}\n"
+              )
+
           PY
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install project and PostgreSQL test dependencies
         run: >-
-          python -m pip install --disable-pip-version-check --no-input
+          python -m pip install
+          --disable-pip-version-check
+          --no-input
           -r requirements.txt
           -r requirements-postgres.txt
 
