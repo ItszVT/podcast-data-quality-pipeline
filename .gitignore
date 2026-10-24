@@ -1,0 +1,47 @@
+.venv*/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pytest-tmp/
+work/
+
+# Logs, temporary files, and local test coverage output
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+.coverage
+coverage.xml
+htmlcov/
+
+# Operating-system and IDE-generated files
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vs/
+
+# Local data withheld pending source redistribution review
+/data/real_podcasts.csv
+
+# Local databases and transient SQLite files
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.sqlite3-*
+*.db
+*.db-*
+
+# Local credentials and environment configuration
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Build output
+build/
+dist/
+*.egg-info/

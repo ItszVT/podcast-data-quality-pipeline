@@ -1,0 +1,5 @@
+case_id,path,expected_classification
+normal_200,/ok,likely_working
+http_404,/404,http_error
+soft_404,/soft404,suspected_soft_404
+prohibited_redirect,/redirect-private,inconclusive
