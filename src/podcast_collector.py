@@ -35,6 +35,8 @@ class FeedMetadata:
     categories: str = ""
     language: str = ""
     episode_text_samples: tuple[str, ...] = ()
+    locations: tuple[dict[str, str], ...] = ()
+    location_parse_errors: int = 0
 
 @dataclass(frozen=True)
 class CollectionResult:
@@ -160,6 +162,24 @@ def parse_rss_metadata(xml_content: bytes) -> FeedMetadata:
             value = element.attrib.get("text", "") or element.attrib.get("term", "") or (element.text or "")
             if value.strip():
                 categories.append(value.strip())
+    # Only accept the official Podcasting 2.0 namespace. Keep these publisher
+    # declarations separate from the channel country and from podcast origin.
+    podcast_ns = "https://podcastindex.org/namespace/1.0"
+    locations: list[dict[str, str]] = []
+    location_parse_errors = 0
+    for element in channel:
+        if element.tag != f"{{{podcast_ns}}}location":
+            continue
+        rel = (element.attrib.get("rel") or "subject").strip().lower()
+        if rel not in {"creator", "subject"}:
+            location_parse_errors += 1
+            continue
+        text = " ".join(value.strip() for value in element.itertext() if value.strip())[:128]
+        country = (element.attrib.get("country") or "").strip()[:16]
+        if text or country:
+            locations.append({"rel": rel, "text": text, "country": country})
+        else:
+            location_parse_errors += 1
     samples: list[str] = []
     for episode in channel:
         if tag(episode) not in {"item", "entry"} or len(samples) >= 8:
@@ -177,7 +197,7 @@ def parse_rss_metadata(xml_content: bytes) -> FeedMetadata:
         sample = " ".join(parts).strip()
         if sample:
             samples.append(sample[:1600])
-    return FeedMetadata(website, find_text("description", "summary", "subtitle"), "; ".join(dict.fromkeys(categories)), find_text("language"), tuple(samples))
+    return FeedMetadata(website, find_text("description", "summary", "subtitle"), "; ".join(dict.fromkeys(categories)), find_text("language"), tuple(samples), tuple(locations), location_parse_errors)
 
 def fetch_rss_metadata(feed_url: str, config: CollectorConfig | None = None) -> FeedMetadata:
     content, _ = _safe_get_bytes(feed_url, config or CollectorConfig())
@@ -203,6 +223,10 @@ def collect_podcasts(config: CollectorConfig | None = None, *, api_search: Calla
     api_count = rss_successes = rss_failures = rss_missing = 0
     api_errors: list[str] = []
     geo_field_sources: dict[str, dict[str, str]] = {}
+    rss_evidence_status: dict[str, str] = {}
+    structured_locations_by_feed: dict[str, list[dict[str, str]]] = {}
+    location_parse_errors_by_feed: dict[str, int] = {}
+    apple_storefront_by_feed: dict[str, str] = {}
     for term_index, term in enumerate(terms):
         if term_index and settings.api_pacing_seconds:
             sleeper(settings.api_pacing_seconds)
@@ -224,6 +248,10 @@ def collect_podcasts(config: CollectorConfig | None = None, *, api_search: Calla
             seen.add(feed_id)
             genres = item.get("genres", [])
             records.append({"feed_id": feed_id, "title": str(title), "website_url": "", "description": str(item.get("description") or ""), "categories": "; ".join(dict.fromkeys(str(v) for v in genres if v)), "language": "", "country": "", "_feed_url": str(item.get("feedUrl") or "")})
+            # Apple country is the requested catalog storefront, not a creator
+            # or origin location. Retain only the documented semantic context.
+            if item.get("country"):
+                apple_storefront_by_feed[feed_id] = str(item["country"])[:16]
             geo_field_sources[feed_id] = {
                 "title": "Apple Search API collectionName",
                 "description": "Apple Search API description" if item.get("description") else "source not recorded",
@@ -238,6 +266,7 @@ def collect_podcasts(config: CollectorConfig | None = None, *, api_search: Calla
         feed_url = record.pop("_feed_url")
         if not feed_url:
             rss_missing += 1
+            rss_evidence_status[record["feed_id"]] = "unavailable"
             continue
         if settings.rss_pacing_seconds:
             sleeper(settings.rss_pacing_seconds)
@@ -245,21 +274,27 @@ def collect_podcasts(config: CollectorConfig | None = None, *, api_search: Calla
             metadata = rss_fetcher(feed_url, settings)
         except (CollectionError, requests.RequestException, OSError, ValueError) as exc:
             rss_failures += 1
+            rss_evidence_status[record["feed_id"]] = "unavailable"
             # Feed URLs can contain query parameters; never persist raw errors.
             rss_errors.append(f"{record['feed_id']}: {type(exc).__name__}")
             continue
         rss_successes += 1
+        rss_evidence_status[record["feed_id"]] = "checked"
         for field in ("website_url", "description", "categories", "language"):
             value = getattr(metadata, field)
             if value:
                 record[field] = value
                 if field in {"title", "description"}:
                     geo_field_sources[record["feed_id"]][field] = "publisher RSS channel metadata"
+                elif field == "language":
+                    geo_field_sources[record["feed_id"]][field] = "publisher RSS channel language"
+        structured_locations_by_feed[record["feed_id"]] = list(getattr(metadata, "locations", ()))
+        location_parse_errors_by_feed[record["feed_id"]] = int(getattr(metadata, "location_parse_errors", 0) or 0)
         samples = getattr(metadata, "episode_text_samples", ())
         if samples:
             episode_samples_by_feed[record["feed_id"]] = tuple(samples[:8])
     missing = {field: sum(not str(row.get(field, "")).strip() for row in records) for field in CSV_FIELDS}
-    report = {"collection_date": date.today().isoformat(), "source": "Apple iTunes Search API and publisher RSS channel metadata", "api_endpoint": ITUNES_SEARCH_URL, "storefront": "US search catalog (not treated as publisher country)", "search_terms": list(terms), "api_result_instances": api_count, "unique_records_retained": len(records), "rss_retrieval_successes": rss_successes, "rss_retrieval_failures": rss_failures, "missing_rss_feed_urls": rss_missing, "missing_field_counts": missing, "api_search_errors": api_errors, "rss_errors": rss_errors, "geo_field_sources": geo_field_sources, "episode_text_samples_by_feed": episode_samples_by_feed, "limitations": ["Search coverage depends on selected terms and the US Apple storefront; it is not a complete directory.", "Publisher country is blank because storefront country does not establish publisher location.", "Only API-provided feedUrl values are fetched. RSS website links supply publisher website metadata; feed URLs are never substituted as websites.", "RSS requests are sequential, response-size limited, timeout bounded, and every redirect is checked against public IP destinations.", "DNS is checked immediately before connection, but the HTTP library resolves again; DNS rebinding between validation and connection remains possible.", "Descriptions and arbitrary RSS links are text only and are never fetched."]}
+    report = {"collection_date": date.today().isoformat(), "source": "Apple iTunes Search API and publisher RSS channel metadata", "api_endpoint": ITUNES_SEARCH_URL, "storefront": "US search catalog (not treated as publisher country)", "search_terms": list(terms), "api_result_instances": api_count, "unique_records_retained": len(records), "rss_retrieval_successes": rss_successes, "rss_retrieval_failures": rss_failures, "missing_rss_feed_urls": rss_missing, "missing_field_counts": missing, "api_search_errors": api_errors, "rss_errors": rss_errors, "geo_field_sources": geo_field_sources, "rss_evidence_status_by_feed": rss_evidence_status, "structured_locations_by_feed": structured_locations_by_feed, "location_parse_errors_by_feed": location_parse_errors_by_feed, "apple_storefront_by_feed": apple_storefront_by_feed, "episode_text_samples_by_feed": episode_samples_by_feed, "limitations": ["Search coverage depends on selected terms and the US Apple storefront; it is not a complete directory.", "Publisher country is blank because storefront country does not establish publisher location.", "Only API-provided feedUrl values are fetched. RSS website links supply publisher website metadata; feed URLs are never substituted as websites.", "RSS requests are sequential, response-size limited, timeout bounded, and every redirect is checked against public IP destinations.", "DNS is checked immediately before connection, but the HTTP library resolves again; DNS rebinding between validation and connection remains possible.", "Descriptions and arbitrary RSS links are text only and are never fetched."]}
     return CollectionResult(tuple({field: row.get(field, "") for field in CSV_FIELDS} for row in records), report)
 
 def render_report(report: dict[str, Any]) -> str:

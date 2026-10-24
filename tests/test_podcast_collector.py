@@ -148,6 +148,7 @@ def test_failed_rss_keeps_api_record_and_reports_failure():
     assert result.records[0]["website_url"] == ""
     assert result.report["rss_retrieval_failures"] == 1
     assert result.report["rss_errors"] == ["itunes:collection:12: CollectionError"]
+    assert result.report["rss_evidence_status_by_feed"]["itunes:collection:12"] == "unavailable"
     assert sensitive_url not in repr(result.report)
 
 
@@ -163,3 +164,42 @@ def test_write_collection_creates_expected_csv_and_refuses_overwrite(tmp_path):
     assert "Unique records retained: 1" in report.read_text(encoding="utf-8")
     with pytest.raises(CollectionError, match="Refusing to overwrite"):
         write_collection(result, output, report)
+
+
+def test_rss_parser_extracts_namespaced_creator_and_subject_locations_safely():
+    body = b'''<rss xmlns:podcast="https://podcastindex.org/namespace/1.0"><channel>
+    <podcast:location rel="creator" country="CA">Toronto</podcast:location>
+    <podcast:location rel="subject" country="US">New York</podcast:location>
+    <podcast:location rel="creator">Montreal</podcast:location>
+    <podcast:location rel="unknown">Ignored</podcast:location>
+    <podcast:location rel="subject"></podcast:location>
+    </channel></rss>'''
+    metadata = parse_rss_metadata(body)
+    assert metadata.locations == (
+        {"rel": "creator", "text": "Toronto", "country": "CA"},
+        {"rel": "subject", "text": "New York", "country": "US"},
+        {"rel": "creator", "text": "Montreal", "country": ""},
+    )
+    assert metadata.location_parse_errors == 2
+
+
+def test_wrong_namespace_location_is_not_misclassified():
+    metadata = parse_rss_metadata(b'''<rss xmlns:other="urn:not-podcast"><channel>
+    <other:location rel="creator" country="CA">Toronto</other:location>
+    </channel></rss>''')
+    assert metadata.locations == ()
+    assert metadata.location_parse_errors == 0
+
+
+def test_collector_records_rss_coverage_and_apple_storefront_without_origin():
+    metadata = FeedMetadata(language="en", locations=({"rel": "creator", "text": "Toronto", "country": "CA"},))
+    result = collect_podcasts(
+        CollectorConfig(api_pacing_seconds=0, rss_pacing_seconds=0),
+        api_search=lambda *_: [{"collectionId": 9, "collectionName": "Show", "country": "USA", "feedUrl": "https://feed.invalid/rss"}],
+        rss_fetcher=lambda *_: metadata, sleeper=lambda _: None, search_terms=("one",),
+    )
+    feed_id = "itunes:collection:9"
+    assert result.report["rss_evidence_status_by_feed"][feed_id] == "checked"
+    assert result.report["structured_locations_by_feed"][feed_id][0]["rel"] == "creator"
+    assert result.report["apple_storefront_by_feed"][feed_id] == "USA"
+    assert result.records[0]["country"] == ""

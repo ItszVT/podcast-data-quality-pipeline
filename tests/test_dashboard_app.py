@@ -29,6 +29,15 @@ def test_dashboard_is_read_only_and_does_not_call_website_checker():
     assert 'summary["run_status"] == "partial"' in source
     assert 'summary.get("website_check_status") == "partial"' in source
     assert "Website checking completed partially" in source
+    geo_start = source.index('elif section == "Geo Intelligence":')
+    geo_end = source.index('elif section == "Audit history":', geo_start)
+    geo_section = source[geo_start:geo_end]
+    assert 'metric("Podcasts analyzed"' in geo_section
+    assert 'metric("RSS checked"' in geo_section
+    assert 'metric("Creator locations"' in geo_section
+    assert geo_section.index('metric("Podcasts analyzed"') < geo_section.index('st.subheader("Geographic claims found")')
+    assert '"Evidence sufficient"' in geo_section
+    assert '"Observed"' in geo_section
 
 
 def test_selected_database_views_are_read_only_and_empty_checks_are_not_failures(tmp_path):

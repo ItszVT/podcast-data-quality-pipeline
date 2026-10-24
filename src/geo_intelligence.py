@@ -128,6 +128,8 @@ def classify_episode_languages(samples: Iterable[str], *, detector=None) -> dict
         "status": result,
         "languages": languages,
         "episode_samples_seen": supplied,
+        "usable_episode_samples": supplied,
+        "evidence_sufficient": result in {"identified", "multilingual"},
         "strong_model_matches": len(candidates),
         "detector_available": detector_available,
         "confidence_explanation": (
@@ -157,6 +159,11 @@ def _observations_for_record(
     record: Any,
     language_evidence: Mapping[str, Any],
     field_sources: Mapping[str, Any],
+    structured_locations: Iterable[Mapping[str, Any]] = (),
+    rss_status: str = "legacy_unavailable",
+    apple_storefront: str | None = None,
+    location_parse_errors: int = 0,
+    observed_at: str | None = None,
 ) -> dict[str, Any]:
     feed_id = str(_record_value(record, "feed_id") or "")
     declared_language = str(_record_value(record, "language") or "").strip().lower().replace("_", "-")
@@ -177,30 +184,63 @@ def _observations_for_record(
         episode_languages = []
     declared_base = declared_language.split("-")[0] if declared_language else None
     episode_status = evidence.get("status", "undetermined")
+    normalized_locations: list[dict[str, Any]] = []
+    for claim in structured_locations if isinstance(structured_locations, (list, tuple)) else ():
+        if not isinstance(claim, Mapping):
+            continue
+        rel = str(claim.get("rel") or "").strip().lower()
+        text = str(claim.get("text") or "").strip()[:128]
+        if rel not in {"creator", "subject"} or not (text or claim.get("country")):
+            continue
+        supplied_country = str(claim.get("country") or "").strip()
+        country_code = _country_from_value(supplied_country) if len(supplied_country) == 2 else None
+        country_reference = _country_reference()
+        country_obj = country_reference.countries.get(alpha_2=country_code) if country_code and country_reference else None
+        normalized_locations.append({
+            "type": f"podcast_location_{rel}", "rel": rel, "location": text or None,
+            "country_code": country_code,
+            "country_name": country_obj.name if country_obj else None,
+            "country_code_valid": not supplied_country or country_code is not None,
+            "source": "publisher RSS podcast:location", "confidence": "publisher-provided; unverified",
+            "observed_at": observed_at,
+        })
+    creator_locations = [item for item in normalized_locations if item["rel"] == "creator"]
+    subject_locations = [item for item in normalized_locations if item["rel"] == "subject"]
     mismatch = bool(
-        declared_base and episode_status == "identified" and episode_languages
+        declared_base and episode_status in {"identified", "multilingual"} and episode_languages
         and declared_base not in episode_languages
     )
     location_claims = [item for item in explicit if item["type"] == "publisher_location_claim"]
+    comparable_creator_countries = {item["country_code"] for item in creator_locations if item["country_code"]}
+    comparable_creator_countries.update(item["country_code"] for item in location_claims)
     country_conflict = bool(
-        declared_country and location_claims
-        and any(item["country_code"] != declared_country for item in location_claims)
+        len(comparable_creator_countries) > 1
+        or declared_country and any(code != declared_country for code in comparable_creator_countries)
     )
+    source_available = rss_status == "checked"
     return {
         "feed_id": feed_id,
         "title": str(_record_value(record, "title") or "Untitled podcast"),
         "identity": {
             "podcast_country_of_origin": {"value": None, "status": "unknown", "reason": "No source establishes podcast origin."},
-            "api_storefront": {"value": "US", "source": "Apple Search API country parameter", "confidence": "explicit request parameter", "meaning": "Catalog queried; not origin, publisher location, or intended audience."},
+            "api_storefront": {"value": apple_storefront or "US", "source": "Apple Search API result/request country", "confidence": "explicit catalog metadata", "meaning": "Catalog queried; not origin, publisher location, or intended audience."},
             "declared_publisher_country": {"value": declared_country, "source": "record country field" if declared_country else None, "declared_value_present": bool(declared_country_value), "confidence": "unverified declaration" if declared_country else "unknown"},
             "publisher_location_claims": location_claims,
             "intended_audience_claims": [item for item in explicit if item["type"] == "intended_audience_claim"],
-            "language": {"declared": declared_language or None, "episode_observation": dict(evidence) if evidence else {"status": "undetermined", "languages": [], "evidence_source": "RSS episode titles/descriptions", "reason": "No qualifying episode text was available."}},
+            "structured_creator_locations": creator_locations,
+            "structured_subject_locations": subject_locations,
+            "language": {"declared": declared_language or None, "declared_source": record_sources.get("language") if declared_language else None, "episode_observation": dict(evidence) if evidence else {"status": "undetermined", "languages": [], "usable_episode_samples": 0, "evidence_sufficient": False, "evidence_source": "RSS episode titles/descriptions", "reason": "No qualifying episode text was available."}},
+            "evidence_availability": {
+                "rss": "checked" if source_available else "unavailable" if rss_status == "unavailable" else "legacy_or_unrecorded",
+                "structured_creator_location": "claim_found" if creator_locations else "extraction_failed" if source_available and location_parse_errors else "no_claim_found" if source_available else "source_unavailable" if rss_status == "unavailable" else "legacy_unavailable",
+                "structured_subject_location": "claim_found" if subject_locations else "extraction_failed" if source_available and location_parse_errors else "no_claim_found" if source_available else "source_unavailable" if rss_status == "unavailable" else "legacy_unavailable",
+                "declared_language": "claim_found" if declared_language else "no_claim_found" if source_available else "source_unavailable" if rss_status == "unavailable" else "legacy_unavailable",
+            },
         },
         "geographic_identity_conflict": {
             "status": "review" if country_conflict else "none_supported",
             "potential_conflict": country_conflict,
-            "evidence": "Structured country declaration differs from explicit publisher-location wording." if country_conflict else None,
+            "evidence": "Comparable publisher-country and creator-location claims disagree." if country_conflict else None,
         },
         "language_inconsistency": {
             "status": "review" if mismatch else "none_supported",
@@ -211,6 +251,8 @@ def _observations_for_record(
             "declared_publisher_country": declared_country,
             "declared_language": declared_base,
             "publisher_location_claims": sorted({item["country_code"] for item in location_claims}),
+            "structured_creator_locations": sorted([[item["country_code"] or "", (item["location"] or "").casefold()] for item in creator_locations]),
+            "structured_subject_locations": sorted([[item["country_code"] or "", (item["location"] or "").casefold()] for item in subject_locations]),
             "intended_audience_claims": sorted({item["country_code"] for item in explicit if item["type"] == "intended_audience_claim"}),
             "episode_language": sorted(set(episode_languages)) if episode_status in {"identified", "multilingual"} else None,
         },
@@ -260,6 +302,30 @@ def _historical_observations(database_path: str | Path) -> tuple[dict[str, list[
         return {}, []
 
 
+def summarize_geo_evidence(records: Iterable[Mapping[str, Any]]) -> dict[str, int]:
+    """Count coverage and findings from saved observations, without inference."""
+    rows = list(records)
+    coverage = [item.get("identity", {}).get("evidence_availability", {}) for item in rows]
+    return {
+        "podcasts_analyzed": len(rows),
+        "rss_checked": sum(item.get("rss") == "checked" for item in coverage),
+        "rss_unavailable": sum(item.get("rss") == "unavailable" for item in coverage),
+        "rss_legacy_unrecorded": sum(item.get("rss") == "legacy_or_unrecorded" for item in coverage),
+        "creator_location_claims": sum(item.get("structured_creator_location") == "claim_found" for item in coverage),
+        "creator_location_no_claim": sum(item.get("structured_creator_location") == "no_claim_found" for item in coverage),
+        "creator_location_unavailable": sum(item.get("structured_creator_location") in {"source_unavailable", "legacy_unavailable"} for item in coverage),
+        "creator_location_extraction_failed": sum(item.get("structured_creator_location") == "extraction_failed" for item in coverage),
+        "subject_location_claims": sum(item.get("structured_subject_location") == "claim_found" for item in coverage),
+        "subject_location_no_claim": sum(item.get("structured_subject_location") == "no_claim_found" for item in coverage),
+        "subject_location_unavailable": sum(item.get("structured_subject_location") in {"source_unavailable", "legacy_unavailable"} for item in coverage),
+        "subject_location_extraction_failed": sum(item.get("structured_subject_location") == "extraction_failed" for item in coverage),
+        "declared_language_claims": sum(item.get("declared_language") == "claim_found" for item in coverage),
+        "declared_language_no_claim": sum(item.get("declared_language") == "no_claim_found" for item in coverage),
+        "declared_language_unavailable": sum(item.get("declared_language") in {"source_unavailable", "legacy_unavailable"} for item in coverage),
+        "potential_conflicts": sum(bool(item.get("geographic_identity_conflict", {}).get("potential_conflict")) for item in rows),
+    }
+
+
 def build_geo_intelligence(
     database_path: str | Path,
     records: Iterable[Any],
@@ -273,7 +339,28 @@ def build_geo_intelligence(
     field_sources = collection_report.get("geo_field_sources", {})
     if not isinstance(field_sources, Mapping):
         field_sources = {}
-    current = [_observations_for_record(row, language_evidence, field_sources) for row in records]
+    structured_locations = collection_report.get("structured_locations_by_feed", {})
+    rss_statuses = collection_report.get("rss_evidence_status_by_feed", {})
+    apple_storefronts = collection_report.get("apple_storefront_by_feed", {})
+    location_parse_errors = collection_report.get("location_parse_errors_by_feed", {})
+    if not isinstance(structured_locations, Mapping):
+        structured_locations = {}
+    if not isinstance(rss_statuses, Mapping):
+        rss_statuses = {}
+    if not isinstance(apple_storefronts, Mapping):
+        apple_storefronts = {}
+    if not isinstance(location_parse_errors, Mapping):
+        location_parse_errors = {}
+    current = []
+    for row in records:
+        feed_id = str(_record_value(row, "feed_id") or "")
+        current.append(_observations_for_record(
+            row, language_evidence, field_sources,
+            structured_locations.get(feed_id, ()),
+            str(rss_statuses.get(feed_id, "legacy_unavailable")),
+            str(apple_storefronts.get(feed_id) or "US"),
+            int(location_parse_errors.get(feed_id, 0) or 0), observed_at,
+        ))
     history, prior_runs = _historical_observations(database_path)
     drift = []
     for item in current:
@@ -302,9 +389,10 @@ def build_geo_intelligence(
     conflicts = [item for item in current if item["geographic_identity_conflict"]["potential_conflict"]]
     language_findings = [item for item in current if item["language_inconsistency"]["potential_inconsistency"]]
     return {
-        "version": 1,
+        "version": 2,
         "storefront_context": {"value": "US", "source": "Apple Search API country parameter", "not_a_claim_about": ["podcast origin", "publisher location", "intended audience"]},
         "records": current,
+        "evidence_coverage": summarize_geo_evidence(current),
         "identity_conflicts": conflicts,
         "language_inconsistencies": language_findings,
         "drift": drift,

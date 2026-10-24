@@ -8,6 +8,7 @@ import streamlit as st
 
 from src import dashboard_data as data
 from src.published_snapshot import SnapshotValidationError, validate_publishable_snapshot
+from src.geo_intelligence import summarize_geo_evidence
 
 # The database access module is project code; reload it with the app so changes
 # to its read-only queries are available after Streamlit hot reloads this file.
@@ -371,6 +372,16 @@ elif section == "Geo Intelligence":
         storefront = geo.get("storefront_context", {})
         st.caption(f"Apple storefront: {storefront.get('value', 'Not recorded')} — {storefront.get('source', 'source not recorded')}. This identifies the catalog searched only.")
         records_geo = geo.get("records", [])
+        coverage = geo.get("evidence_coverage") or summarize_geo_evidence(records_geo)
+        metric_columns = st.columns(4)
+        metric_columns[0].metric("Podcasts analyzed", coverage.get("podcasts_analyzed", len(records_geo)))
+        metric_columns[1].metric("RSS checked", coverage.get("rss_checked", 0), help=f"{coverage.get('rss_unavailable', 0)} unavailable; legacy audits may not record RSS coverage.")
+        metric_columns[2].metric("Creator locations", coverage.get("creator_location_claims", 0), help=f"{coverage.get('creator_location_no_claim', 0)} checked with no claim; {coverage.get('creator_location_unavailable', 0)} unavailable/legacy; {coverage.get('creator_location_extraction_failed', 0)} extraction failures.")
+        metric_columns[3].metric("Subject locations", coverage.get("subject_location_claims", 0), help=f"{coverage.get('subject_location_no_claim', 0)} checked with no claim; {coverage.get('subject_location_unavailable', 0)} unavailable/legacy; {coverage.get('subject_location_extraction_failed', 0)} extraction failures.")
+        metric_columns = st.columns(3)
+        metric_columns[0].metric("Declared languages", coverage.get("declared_language_claims", 0), help=f"{coverage.get('declared_language_no_claim', 0)} checked with no declaration; {coverage.get('declared_language_unavailable', 0)} unavailable/legacy.")
+        metric_columns[1].metric("Potential conflicts", coverage.get("potential_conflicts", 0), help="Only comparable, explicit country claims are counted.")
+        metric_columns[2].metric("RSS unavailable", coverage.get("rss_unavailable", 0))
         identity_rows = []
         language_rows = []
         for item in records_geo:
@@ -379,27 +390,35 @@ elif section == "Geo Intelligence":
             episode = language.get("episode_observation", {})
             location = identity.get("publisher_location_claims", [])
             audience = identity.get("intended_audience_claims", [])
-            identity_rows.append({
-                "Podcast": item.get("title", "Untitled podcast"),
-                "Podcast origin": "Unknown" if identity.get("podcast_country_of_origin", {}).get("value") is None else identity["podcast_country_of_origin"]["value"],
-                "Declared publisher country": identity.get("declared_publisher_country", {}).get("value") or "Unknown",
-                "Publisher location claims": "; ".join(f"{claim.get('country_name')} — {claim.get('source')} ({claim.get('confidence')})" for claim in location) or "None found",
-                "Intended audience claims": "; ".join(f"{claim.get('country_name')} — {claim.get('source')} ({claim.get('confidence')})" for claim in audience) or "None found",
-            })
+            for claim in identity.get("structured_creator_locations", []) + identity.get("structured_subject_locations", []) + location + audience:
+                identity_rows.append({
+                    "Podcast": item.get("title", "Untitled podcast"),
+                    "Claim type": claim.get("type", claim.get("rel", "explicit text")),
+                    "Location": claim.get("location") or claim.get("country_name") or "Text claim",
+                    "Country": claim.get("country_name") or claim.get("country_code") or "Not supplied/invalid",
+                    "Source": claim.get("source", "Source provenance unavailable"),
+                    "Confidence": claim.get("confidence", "publisher-provided; unverified"),
+                    "Observed": claim.get("observed_at") or "Historical timestamp unavailable",
+                })
             language_rows.append({
                 "Podcast": item.get("title", "Untitled podcast"),
                 "Declared language": language.get("declared") or "Not recorded",
                 "Episode language observation": ", ".join(episode.get("languages", [])) or episode.get("status", "undetermined").replace("_", " ").title(),
+                "Usable episode samples": episode.get("usable_episode_samples", episode.get("episode_samples_seen", 0)),
+                "Evidence sufficient": "Yes" if episode.get("evidence_sufficient", episode.get("status") in {"identified", "multilingual"}) else "No",
                 "Evidence": episode.get("evidence_source", "No episode language evidence"),
             })
         if identity_rows:
-            st.subheader("Geographic identity evidence")
-            st.dataframe(pd.DataFrame(identity_rows), hide_index=True, alt="Explicit geographic identity evidence and unknown origin values")
+            st.subheader("Geographic claims found")
+            st.caption("Creator locations describe publisher-declared production places; subject locations describe content focus. Neither establishes podcast origin. Country codes are validated, but claims remain unverified.")
+            st.dataframe(pd.DataFrame(identity_rows), hide_index=True, alt="Publisher-provided geographic claims with provenance and confidence")
+        else:
+            st.info("No structured location or explicit geographic text claims were found in the available evidence.")
         conflicts = geo.get("identity_conflicts", [])
         if conflicts:
             st.subheader("Identity conflicts to review")
             st.warning("These are conflicting source claims, not verified errors.")
-            st.dataframe(pd.DataFrame([{"Podcast": item.get("title"), "Evidence": item.get("geographic_identity_conflict", {}).get("evidence")} for item in conflicts]), hide_index=True, alt="Potential geographic identity conflicts with source evidence")
+            st.dataframe(pd.DataFrame([{"Podcast": item.get("title"), "Evidence": item.get("geographic_identity_conflict", {}).get("evidence"), "Creator claims": item.get("identity", {}).get("structured_creator_locations", []), "Publisher country": item.get("identity", {}).get("declared_publisher_country", {}).get("value")} for item in conflicts]), hide_index=True, alt="Potential geographic identity conflicts with comparable source evidence")
         else:
             st.info("No supported geographic identity conflict was found in the available records.")
         if language_rows:
