@@ -18,8 +18,6 @@ jobs:
     env:
       SNAPSHOT_BRANCH: audit-snapshots
       SNAPSHOT_FILE: data/real_podcast_audits.sqlite
-      TEMP_DATABASE: ${{ runner.temp }}/podcast-collection-verification.sqlite
-      PIPELINE_OUTPUT: ${{ runner.temp }}/podcast-collection-verification.json
 
     steps:
       - name: Check out pipeline source
@@ -27,6 +25,14 @@ jobs:
         with:
           ref: master
           fetch-depth: 0
+
+      - name: Set temporary verification paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'TEMP_DATABASE=%s\nPIPELINE_OUTPUT=%s\n' \
+            "$RUNNER_TEMP/podcast-collection-verification.sqlite" \
+            "$RUNNER_TEMP/podcast-collection-verification.json" >> "$GITHUB_ENV"
 
       - name: Set up Python
         uses: actions/setup-python@v5
