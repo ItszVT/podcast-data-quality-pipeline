@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 from urllib.parse import urlsplit
@@ -23,6 +24,8 @@ class Handler(BaseHTTPRequestHandler):
     body = RSS
     status = 200
     location = None
+    content_length_header = "auto"
+    chunked = False
     def do_GET(self):
         self.server.requests_seen += 1
         if self.path == "/redirect-private":
@@ -30,17 +33,32 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Location", "http://127.0.0.1/private")
             self.end_headers()
             return
+        self.protocol_version = "HTTP/1.1" if self.chunked else "HTTP/1.0"
         self.send_response(self.status)
-        self.send_header("Content-Length", str(len(self.body)))
+        if self.chunked:
+            self.send_header("Transfer-Encoding", "chunked")
+        elif self.content_length_header == "auto":
+            self.send_header("Content-Length", str(len(self.body)))
+        elif self.content_length_header is not None:
+            self.send_header("Content-Length", str(self.content_length_header))
         self.send_header("Content-Type", "application/rss+xml")
+        self.send_header("Connection", "close")
         self.end_headers()
-        self.wfile.write(self.body)
+        if self.chunked:
+            split = max(1, len(self.body) // 2)
+            for chunk in (self.body[:split], self.body[split:]):
+                if chunk:
+                    self.wfile.write(f"{len(chunk):X}\r\n".encode("ascii") + chunk + b"\r\n")
+            self.wfile.write(b"0\r\n\r\n")
+        else:
+            self.wfile.write(self.body)
     def log_message(self, *_args):
         pass
 
 @pytest.fixture
 def local_server():
     Handler.body, Handler.status = RSS, 200
+    Handler.content_length_header, Handler.chunked = "auto", False
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     server.requests_seen = 0
     thread = Thread(target=server.serve_forever, daemon=True)
@@ -85,6 +103,114 @@ def test_fetch_rss_metadata_from_controlled_local_fixture(local_server):
     result = fetch_rss_metadata(base + "/feed", CollectorConfig())
     assert result.website_url == "https://publisher.example/show"
     assert server.requests_seen == 1
+
+
+def collect_single_rss_report(base, *, max_response_bytes=2_000_000):
+    config = CollectorConfig(
+        max_records=1, repeat_target=0, exploration_target=1,
+        max_response_bytes=max_response_bytes, api_pacing_seconds=0,
+        rss_pacing_seconds=0,
+    )
+    return collect_podcasts(
+        config,
+        api_search=lambda *_args: [{
+            "collectionId": 901, "collectionName": "Fixture Podcast",
+            "feedUrl": base + "/feed",
+        }],
+        rss_fetcher=fetch_rss_metadata,
+        sleeper=lambda _seconds: None,
+        search_terms=("fixture",),
+    ).report
+
+
+def test_rss_size_telemetry_records_valid_declared_length_as_unverified_band(local_server):
+    _server, base = local_server
+    report = collect_single_rss_report(base)
+    diagnostics = report["rss_response_size_diagnostics"]
+
+    assert CollectorConfig().max_response_bytes == 2_000_000
+    assert diagnostics["declared_content_length_status_counts"]["valid"] == 1
+    assert diagnostics["declared_content_length_size_bands"]["under_256_kib"] == 1
+    assert diagnostics["size_limit_failure_count"] == 0
+    assert report["rss_retrieval_successes"] == 1
+
+
+def test_rss_size_telemetry_missing_length_is_unknown_and_non_blocking(local_server):
+    _server, base = local_server
+    Handler.content_length_header = None
+    report = collect_single_rss_report(base)
+    diagnostics = report["rss_response_size_diagnostics"]
+
+    assert diagnostics["declared_content_length_status_counts"]["missing"] == 1
+    assert diagnostics["declared_content_length_size_bands"]["unknown"] == 1
+    assert report["rss_retrieval_successes"] == 1
+
+
+def test_rss_size_telemetry_malformed_wire_length_is_unknown_not_size_failure(local_server):
+    _server, base = local_server
+    Handler.content_length_header = "not-a-number"
+    report = collect_single_rss_report(base)
+    diagnostics = report["rss_response_size_diagnostics"]
+
+    # libcurl may reject malformed HTTP framing before exposing response headers.
+    # It remains an unknown/unavailable measurement, never a size-limit result.
+    assert sum(diagnostics["declared_content_length_status_counts"].values()) == 1
+    assert diagnostics["declared_content_length_size_bands"]["unknown"] == 1
+    assert report["rss_outcome_counts"]["response_size_limit"] == 0
+
+
+def test_content_length_parser_classifies_invalid_values_without_exposing_them():
+    class Response:
+        headers = {"Content-Length": "not-a-number"}
+
+    assert collector._declared_content_length(Response()) == ("invalid", "unknown")
+
+
+def test_rss_size_telemetry_chunked_body_uses_unknown_declared_band(local_server):
+    _server, base = local_server
+    Handler.chunked = True
+    Handler.content_length_header = None
+    report = collect_single_rss_report(base)
+    diagnostics = report["rss_response_size_diagnostics"]
+
+    assert diagnostics["declared_content_length_status_counts"]["missing"] == 1
+    assert diagnostics["declared_content_length_size_bands"]["unknown"] == 1
+    assert report["rss_retrieval_successes"] == 1
+    assert report["rss_attempt_counts_reconcile"] is True
+
+
+def test_misleading_declared_length_is_not_used_as_received_size_or_size_failure(local_server):
+    _server, base = local_server
+    Handler.content_length_header = "2000001"
+    report = collect_single_rss_report(base)
+    diagnostics = report["rss_response_size_diagnostics"]
+
+    assert diagnostics["declared_content_length_status_counts"]["valid"] == 1
+    assert diagnostics["declared_content_length_size_bands"]["over_2_000_000_bytes"] == 1
+    assert diagnostics["size_limit_failure_count"] == 0
+    assert report["rss_outcome_counts"]["response_size_limit"] == 0
+    assert report["rss_retrieval_successes"] == 0
+
+
+def test_rss_size_limit_observations_reconcile_without_retaining_response_data(local_server):
+    _server, base = local_server
+    Handler.body = b"x" * 100
+    report = collect_single_rss_report(base, max_response_bytes=20)
+    diagnostics = report["rss_response_size_diagnostics"]
+    lower_bounds = diagnostics["size_limit_observed_body_lower_bound_bands"]
+
+    assert report["rss_outcome_counts"]["response_size_limit"] == 1
+    assert diagnostics["size_limit_failure_count"] == 1
+    assert lower_bounds["over_limit_to_limit_plus_64_kib"] == 1
+    assert sum(diagnostics["declared_content_length_status_counts"].values()) == report["rss_attempted_count"]
+    assert sum(diagnostics["declared_content_length_size_bands"].values()) == report["rss_attempted_count"]
+    assert sum(lower_bounds.values()) == diagnostics["size_limit_failure_count"]
+    assert diagnostics["attempt_count"] == report["rss_attempted_count"]
+    assert "observed_body_bytes_lower_bound" not in diagnostics
+    serialized_diagnostics = json.dumps(diagnostics)
+    assert base not in serialized_diagnostics
+    assert "127.0.0.1" not in serialized_diagnostics
+    assert "response body" not in serialized_diagnostics
 
 
 def test_redirect_to_private_destination_is_rejected_before_second_request(local_server):

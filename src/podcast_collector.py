@@ -113,6 +113,39 @@ def _apple_collection_id(value: object) -> str | None:
     text = str(value)
     return text if re.fullmatch(r"[1-9][0-9]*", text) else None
 
+
+_RSS_DECLARED_SIZE_BANDS = (
+    "under_256_kib", "256_kib_to_1_mib", "1_mib_to_2_000_000_bytes",
+    "over_2_000_000_bytes", "unknown",
+)
+
+
+def _declared_content_length(response: object | None) -> tuple[str, str]:
+    """Return sanitized header status and band; Content-Length is only a claim."""
+    try:
+        headers = getattr(response, "headers", None)
+        if headers is None or not hasattr(headers, "get"):
+            return "unavailable", "unknown"
+        value = headers.get("Content-Length")
+        if value is None:
+            return "missing", "unknown"
+        text = str(value).strip()
+    except Exception:
+        # Telemetry must never turn a usable response into a collection failure.
+        return "unavailable", "unknown"
+    if not text or len(text) > 20 or re.fullmatch(r"[0-9]+", text) is None:
+        return "invalid", "unknown"
+    size = int(text)
+    if size < 256 * 1024:
+        band = "under_256_kib"
+    elif size < 1024 * 1024:
+        band = "256_kib_to_1_mib"
+    elif size < 2_000_000:
+        band = "1_mib_to_2_000_000_bytes"
+    else:
+        band = "over_2_000_000_bytes"
+    return "valid", band
+
 @dataclass(frozen=True)
 class CollectorConfig:
     max_records: int = 50
@@ -200,10 +233,29 @@ def _validate_public_url(url: str) -> tuple[str, str, int]:
             raise CollectionError(f"A non-public destination address was rejected: {address}.")
     return url, host, port
 
-def _safe_get_bytes(url: str, config: CollectorConfig, *, deadline_monotonic: float | None = None) -> tuple[bytes, str]:
+def _safe_get_bytes(
+    url: str,
+    config: CollectorConfig,
+    *,
+    deadline_monotonic: float | None = None,
+    size_observation: dict[str, Any] | None = None,
+) -> tuple[bytes, str]:
     """Fetch over pinned libcurl with strict TLS, manual redirects, and byte/time caps."""
     current = url
     stage_deadline = deadline_monotonic or (time.monotonic() + config.rss_request_timeout_seconds)
+
+    def capture_declared_size(response: object | None) -> None:
+        if size_observation is not None:
+            status, band = _declared_content_length(response)
+            size_observation["content_length_status"] = status
+            size_observation["declared_content_length_band"] = band
+
+    if size_observation is not None:
+        size_observation.update({
+            "content_length_status": "unavailable",
+            "declared_content_length_band": "unknown",
+            "observed_body_bytes_lower_bound": None,
+        })
     for hop in range(config.max_redirects + 1):
         remaining = stage_deadline - time.monotonic()
         if remaining <= 0:
@@ -234,8 +286,14 @@ def _safe_get_bytes(url: str, config: CollectorConfig, *, deadline_monotonic: fl
 
         def collect_chunk(chunk: bytes) -> int:
             nonlocal too_large
-            if len(body) + len(chunk) > config.max_response_bytes:
+            observed_bytes = len(body) + len(chunk)
+            if observed_bytes > config.max_response_bytes:
                 too_large = True
+                if size_observation is not None:
+                    # Keep only a capped lower bound; never retain the chunk or body.
+                    size_observation["observed_body_bytes_lower_bound"] = min(
+                        observed_bytes, config.max_response_bytes + 65_536
+                    )
                 return 0
             body.extend(chunk)
             return len(chunk)
@@ -268,21 +326,28 @@ def _safe_get_bytes(url: str, config: CollectorConfig, *, deadline_monotonic: fl
                     proxies={"http": "", "https": ""}, content_callback=collect_chunk,
                 )
         except CurlTimeout as exc:
+            capture_declared_size(getattr(exc, "response", None))
             raise CollectionError("RSS request or collection deadline exceeded.") from exc
         except CertificateVerifyError as exc:
+            capture_declared_size(getattr(exc, "response", None))
             raise CollectionError("RSS TLS certificate verification failed.") from exc
         except DNSError as exc:
+            capture_declared_size(getattr(exc, "response", None))
             raise CollectionError("RSS DNS connection failed.") from exc
         except SSLError as exc:
+            capture_declared_size(getattr(exc, "response", None))
             raise CollectionError("RSS TLS connection failed.") from exc
         except CurlConnectionError as exc:
+            capture_declared_size(getattr(exc, "response", None))
             if too_large:
                 raise CollectionError("RSS response exceeded the configured size limit.") from exc
             raise CollectionError("RSS connection failed safely.") from exc
         except CurlRequestException as exc:
+            capture_declared_size(getattr(exc, "response", None))
             if too_large:
                 raise CollectionError("RSS response exceeded the configured size limit.") from exc
             raise CollectionError("RSS request failed safely.") from exc
+        capture_declared_size(response)
         if too_large:
             raise CollectionError("RSS response exceeded the configured size limit.")
         if response.status_code in {301, 302, 303, 307, 308} and response.headers.get("Location"):
@@ -391,9 +456,18 @@ def parse_rss_metadata(xml_content: bytes, *, max_episode_dates: int = 8) -> Fee
             samples.append(sample[:1600])
     return FeedMetadata(website, find_text("description", "summary", "subtitle"), "; ".join(dict.fromkeys(categories)), find_text("language"), tuple(samples), tuple(locations), location_parse_errors, tuple(publication_dates))
 
-def fetch_rss_metadata(feed_url: str, config: CollectorConfig | None = None, *, deadline_monotonic: float | None = None) -> FeedMetadata:
+def fetch_rss_metadata(
+    feed_url: str,
+    config: CollectorConfig | None = None,
+    *,
+    deadline_monotonic: float | None = None,
+    size_observation: dict[str, Any] | None = None,
+) -> FeedMetadata:
     settings = config or CollectorConfig()
-    content, _ = _safe_get_bytes(feed_url, settings, deadline_monotonic=deadline_monotonic)
+    content, _ = _safe_get_bytes(
+        feed_url, settings, deadline_monotonic=deadline_monotonic,
+        size_observation=size_observation,
+    )
     return parse_rss_metadata(content, max_episode_dates=settings.max_episode_dates_per_feed)
 
 def search_itunes(term: str, config: CollectorConfig | None = None) -> list[dict[str, Any]]:
@@ -625,6 +699,45 @@ def collect_podcasts(config: CollectorConfig | None = None, *, api_search: Calla
         "successful_parsing": 0,
         "other_or_unknown_failure": 0,
     }
+    rss_response_size_diagnostics = {
+        "limit_bytes": settings.max_response_bytes,
+        "attempt_count": 0,
+        "declared_content_length_status_counts": {
+            "valid": 0, "missing": 0, "invalid": 0, "unavailable": 0,
+        },
+        "declared_content_length_size_bands": {
+            band: 0 for band in _RSS_DECLARED_SIZE_BANDS
+        },
+        "size_limit_failure_count": 0,
+        "size_limit_observed_body_lower_bound_bands": {
+            "over_limit_to_limit_plus_64_kib": 0,
+            "at_least_limit_plus_64_kib": 0,
+            "unavailable": 0,
+        },
+    }
+
+    def record_rss_response_size_attempt(
+        observation: dict[str, Any], *, size_limit_failure: bool
+    ) -> None:
+        status = observation.get("content_length_status")
+        if status not in rss_response_size_diagnostics["declared_content_length_status_counts"]:
+            status = "unavailable"
+        band = observation.get("declared_content_length_band")
+        if status != "valid" or band not in rss_response_size_diagnostics["declared_content_length_size_bands"]:
+            band = "unknown"
+        rss_response_size_diagnostics["attempt_count"] += 1
+        rss_response_size_diagnostics["declared_content_length_status_counts"][status] += 1
+        rss_response_size_diagnostics["declared_content_length_size_bands"][band] += 1
+        if size_limit_failure:
+            rss_response_size_diagnostics["size_limit_failure_count"] += 1
+            lower_bound = observation.get("observed_body_bytes_lower_bound")
+            if not isinstance(lower_bound, int) or isinstance(lower_bound, bool):
+                lower_bound_band = "unavailable"
+            elif lower_bound >= settings.max_response_bytes + 65_536:
+                lower_bound_band = "at_least_limit_plus_64_kib"
+            else:
+                lower_bound_band = "over_limit_to_limit_plus_64_kib"
+            rss_response_size_diagnostics["size_limit_observed_body_lower_bound_bands"][lower_bound_band] += 1
     rss_started = clock()
     rss_deadline = rss_started + settings.rss_collection_budget_seconds
     rss_timed_out = False
@@ -673,21 +786,32 @@ def collect_podcasts(config: CollectorConfig | None = None, *, api_search: Calla
                 break
         try:
             rss_attempted += 1
+            size_observation: dict[str, Any] = {}
             if rss_fetcher is fetch_rss_metadata:
-                metadata = rss_fetcher(feed_url, settings, deadline_monotonic=min(rss_deadline, clock() + settings.rss_request_timeout_seconds))
+                metadata = rss_fetcher(
+                    feed_url, settings,
+                    deadline_monotonic=min(rss_deadline, clock() + settings.rss_request_timeout_seconds),
+                    size_observation=size_observation,
+                )
             else:
                 metadata = rss_fetcher(feed_url, settings)
         except Exception as exc:
             rss_failures += 1
             rss_evidence_status[record["feed_id"]] = "unavailable"
             category = _safe_error_category(exc)
-            rss_outcome_counts[_rss_diagnostic_category(category)] += 1
+            diagnostic_category = _rss_diagnostic_category(category)
+            rss_outcome_counts[diagnostic_category] += 1
+            record_rss_response_size_attempt(
+                size_observation,
+                size_limit_failure=diagnostic_category == "response_size_limit",
+            )
             rss_errors.append(f"{record['feed_id']}: {category}")
             if clock() >= rss_deadline:
                 rss_timed_out = True
                 mark_remaining_unattempted(record_index + 1)
                 break
             continue
+        record_rss_response_size_attempt(size_observation, size_limit_failure=False)
         rss_successes += 1
         rss_outcome_counts["successful_parsing"] += 1
         rss_evidence_status[record["feed_id"]] = "checked"
@@ -781,6 +905,7 @@ def collect_podcasts(config: CollectorConfig | None = None, *, api_search: Calla
         "missing_rss_feed_urls": rss_missing,
         "rss_attempted_count": rss_attempted,
         "rss_outcome_counts": rss_outcome_counts,
+        "rss_response_size_diagnostics": rss_response_size_diagnostics,
         "rss_attempt_outcome_total": rss_attempt_outcome_total,
         "rss_attempt_counts_reconcile": rss_attempt_outcome_total == rss_attempted,
         "rss_record_outcome_total": rss_record_outcome_total,

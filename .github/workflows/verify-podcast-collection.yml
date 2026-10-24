@@ -135,6 +135,14 @@ jobs:
           lookup = lookup if isinstance(lookup, dict) else {}
           rss = report.get("rss_outcome_counts")
           rss = rss if isinstance(rss, dict) else {}
+          rss_size = report.get("rss_response_size_diagnostics")
+          rss_size = rss_size if isinstance(rss_size, dict) else {}
+          content_length_status = rss_size.get("declared_content_length_status_counts")
+          content_length_status = content_length_status if isinstance(content_length_status, dict) else {}
+          content_length_bands = rss_size.get("declared_content_length_size_bands")
+          content_length_bands = content_length_bands if isinstance(content_length_bands, dict) else {}
+          observed_lower_bound_bands = rss_size.get("size_limit_observed_body_lower_bound_bands")
+          observed_lower_bound_bands = observed_lower_bound_bands if isinstance(observed_lower_bound_bands, dict) else {}
           lookup_errors_value = report.get("api_lookup_errors")
           lookup_errors_available = isinstance(lookup_errors_value, list)
           lookup_errors = lookup_errors_value if lookup_errors_available else []
@@ -191,6 +199,28 @@ jobs:
               "rss_collection_elapsed_seconds", "rss_collection_budget_seconds",
               "rss_request_timeout_seconds",
           )
+          content_length_status_fields = ("valid", "missing", "invalid", "unavailable")
+          content_length_band_fields = (
+              "under_256_kib", "256_kib_to_1_mib", "1_mib_to_2_000_000_bytes",
+              "over_2_000_000_bytes", "unknown",
+          )
+          observed_lower_bound_fields = (
+              "over_limit_to_limit_plus_64_kib", "at_least_limit_plus_64_kib", "unavailable",
+          )
+          rss_size_counts_reconcile = (
+              all(read_count(content_length_status.get(key)) is not None for key in content_length_status_fields)
+              and all(read_count(content_length_bands.get(key)) is not None for key in content_length_band_fields)
+              and all(read_count(observed_lower_bound_bands.get(key)) is not None for key in observed_lower_bound_fields)
+              and read_count(rss_size.get("attempt_count")) == safe_count(report.get("rss_attempted_count"))
+              and read_count(rss_size.get("limit_bytes")) == 2_000_000
+              and read_count(rss_size.get("size_limit_failure_count")) == safe_count(rss.get("response_size_limit"))
+              and sum(read_count(content_length_status.get(key)) or 0 for key in content_length_status_fields)
+                  == safe_count(report.get("rss_attempted_count"))
+              and sum(read_count(content_length_bands.get(key)) or 0 for key in content_length_band_fields)
+                  == safe_count(report.get("rss_attempted_count"))
+              and sum(read_count(observed_lower_bound_bands.get(key)) or 0 for key in observed_lower_bound_fields)
+                  == safe_count(rss.get("response_size_limit"))
+          )
           diagnostics_complete = (
               diagnostics_available
               and isinstance(report.get("sampling"), dict)
@@ -208,6 +238,7 @@ jobs:
               and sampling.get("repeat_lookup_outcomes_reconcile") is True
               and report.get("rss_attempt_counts_reconcile") is True
               and report.get("rss_record_counts_reconcile") is True
+              and rss_size_counts_reconcile
           )
 
           safe_categories = {
@@ -266,6 +297,20 @@ jobs:
                   "other_or_unknown_failure",
               )
           ))
+          if rss_size_counts_reconcile:
+              print("- RSS declared Content-Length status (declaration, not verified transfer size): " + ", ".join(
+                  f"{name}={content_length_status[name]}" for name in content_length_status_fields
+              ))
+              print("- RSS declared Content-Length size bands: " + ", ".join(
+                  f"{name}={content_length_bands[name]}" for name in content_length_band_fields
+              ))
+              print(
+                  "- RSS size-limit failures / observed callback-body lower-bound bands: "
+                  f"{rss_size['size_limit_failure_count']} / "
+                  + ", ".join(f"{name}={observed_lower_bound_bands[name]}" for name in observed_lower_bound_fields)
+              )
+          else:
+              print("- RSS response-size diagnostics: unavailable or inconsistent")
           print(f"- RSS stage: {elapsed:.1f} seconds" if elapsed is not None else "- RSS stage: unavailable")
           print("- RSS deadline reached: " + (str(report["rss_collection_timed_out"]) if isinstance(report.get("rss_collection_timed_out"), bool) else "unavailable"))
           print(f"- Temporary SQLite integrity: {'ok' if integrity_ok else 'failed'}")

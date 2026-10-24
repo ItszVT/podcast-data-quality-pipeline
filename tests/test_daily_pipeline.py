@@ -214,10 +214,19 @@ def test_prior_audited_ids_are_read_without_modifying_history(tmp_path):
 
 def test_partial_collection_keeps_returned_records_and_marks_snapshot_partial(tmp_path):
     database = tmp_path / "partial.sqlite"
+    size_diagnostics = {
+        "limit_bytes": 2_000_000,
+        "attempt_count": 1,
+        "declared_content_length_status_counts": {"valid": 1},
+        "declared_content_length_size_bands": {"under_256_kib": 1},
+        "size_limit_failure_count": 0,
+        "size_limit_observed_body_lower_bound_bands": {},
+    }
     result = run_daily_pipeline(
         database,
         collector=lambda *_args, **_kwargs: collection(
-            [record()], api_search_errors=["science: temporary failure"]
+            [record()], api_search_errors=["science: temporary failure"],
+            rss_response_size_diagnostics=size_diagnostics,
         ),
         audit_run_id="partial-run",
     )
@@ -229,7 +238,9 @@ def test_partial_collection_keeps_returned_records_and_marks_snapshot_partial(tm
     with read_database(database) as db:
         run = db.execute("SELECT run_status, metadata_json FROM audit_runs").fetchone()
         assert run["run_status"] == "partial"
-        assert json.loads(run["metadata_json"])["collection_report"]["api_search_errors"]
+        metadata = json.loads(run["metadata_json"])
+        assert metadata["collection_report"]["api_search_errors"]
+        assert metadata["collection_report"]["rss_response_size_diagnostics"] == size_diagnostics
 
 
 def test_rss_collection_deadline_marks_saved_audit_partial(tmp_path):

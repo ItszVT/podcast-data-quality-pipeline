@@ -113,6 +113,9 @@ def test_collection_verification_reads_run_scoped_report_and_rejects_missing_dia
     assert "missing or incomplete in this audit's SQLite metadata" in workflow
     assert 'return str(count) if count is not None else "unavailable"' in workflow
     assert "and diagnostics_complete" in workflow
+    assert 'report.get("rss_response_size_diagnostics")' in workflow
+    assert "declared Content-Length status (declaration, not verified transfer size)" in workflow
+    assert "RSS response-size diagnostics: unavailable or inconsistent" in workflow
     assert "contents: read" in workflow
     assert "workflow_dispatch:" in workflow
     assert "git push" not in workflow
