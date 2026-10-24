@@ -1,0 +1,99 @@
+name: Neon PostgreSQL integration tests
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: neon-postgres-integration-tests
+  cancel-in-progress: false
+
+jobs:
+  postgres-integration:
+    name: PostgreSQL integration tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Validate test database target
+        shell: bash
+        env:
+          PODCAST_TEST_DATABASE_URL: ${{ secrets.PODCAST_TEST_DATABASE_URL }}
+          PODCAST_TEST_EXPECTED_DATABASE: podcast_pipeline_test
+          PODCAST_TEST_EXPECTED_USER: podcast_test_runner_v2
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import re
+          from urllib.parse import parse_qsl, unquote, urlsplit
+
+          def fail():
+              raise SystemExit(
+                  "PostgreSQL test target validation failed; no connection was attempted."
+              )
+
+          database_url = os.environ.get("PODCAST_TEST_DATABASE_URL", "").strip()
+          expected_database = os.environ["PODCAST_TEST_EXPECTED_DATABASE"]
+          expected_user = os.environ["PODCAST_TEST_EXPECTED_USER"]
+          if not database_url:
+              fail()
+
+          try:
+              parsed = urlsplit(database_url)
+              hostname = parsed.hostname or ""
+              parsed.port  # Validate malformed and out-of-range port syntax.
+              database = unquote(parsed.path.lstrip("/"))
+              username = unquote(parsed.username) if parsed.username is not None else ""
+              sslmodes = [
+                  value
+                  for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+                  if key == "sslmode"
+              ]
+          except (ValueError, UnicodeError):
+              fail()
+
+          if (
+              parsed.scheme.lower() not in {"postgres", "postgresql"}
+              or not re.fullmatch(r"[A-Za-z0-9.-]+", hostname)
+              or not database
+              or not username
+              or database != expected_database
+              or username != expected_user
+              or "test" not in database.casefold()
+              or sslmodes != ["verify-full"]
+          ):
+              fail()
+
+          # Pass the validated host to the fixture through the runner environment.
+          # It is not printed or included in workflow output.
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as github_env:
+              github_env.write(f"PODCAST_TEST_EXPECTED_HOST={hostname.lower()}\n")
+          PY
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Install project and PostgreSQL test dependencies
+        run: >-
+          python -m pip install --disable-pip-version-check --no-input
+          -r requirements.txt
+          -r requirements-postgres.txt
+
+      - name: Run isolated PostgreSQL integration tests
+        shell: bash
+        env:
+          PODCAST_TEST_DATABASE_URL: ${{ secrets.PODCAST_TEST_DATABASE_URL }}
+          PODCAST_TEST_ALLOW_REMOTE: "1"
+          PODCAST_TEST_EXPECTED_DATABASE: podcast_pipeline_test
+          PODCAST_TEST_EXPECTED_USER: podcast_test_runner_v2
+        run: python -m pytest tests/test_postgres_integration.py -q

@@ -7,6 +7,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+from .database_config import DatabaseConfigurationError, require_sqlite_backend
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 REAL_DATABASE_PATH = PROJECT_ROOT / "data" / "real_podcast_audits.sqlite"
 SYNTHETIC_DATABASE_PATH = PROJECT_ROOT / "data" / "podcast_audits.sqlite"
@@ -34,6 +36,10 @@ class DashboardDataError(RuntimeError):
 @contextmanager
 def _read_connection(database_path: str | Path) -> Iterator[sqlite3.Connection]:
     path = Path(database_path).expanduser()
+    try:
+        require_sqlite_backend(path)
+    except DatabaseConfigurationError as exc:
+        raise DashboardDataError(str(exc)) from exc
     if not path.is_file():
         raise DashboardDataError(
             "SQLite database not found. Select an existing database or run an audit first; the dashboard will not create one."

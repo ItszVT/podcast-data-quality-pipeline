@@ -1,0 +1,2 @@
+# Optional PostgreSQL support for Python 3.11+; install after requirements.txt.
+psycopg[binary]>=3.2,<4; python_version >= "3.11"

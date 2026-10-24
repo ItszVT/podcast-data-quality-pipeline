@@ -13,6 +13,7 @@ from typing import Any, Callable, Sequence
 
 from .audit_runner import AuditRunnerError, validate_existing_database
 from .database import persist_audit_run
+from .database_config import require_sqlite_backend
 from .podcast_collector import SEARCH_TERMS, CollectionResult, CollectorConfig, collect_podcasts
 from .validation import ValidationReport, validate_records
 
@@ -102,6 +103,7 @@ def run_daily_pipeline(
 
     # Reuse the audit runner's existing read-only database compatibility check.
     try:
+        require_sqlite_backend(database_file)
         validate_existing_database(database_file)
         if audit_run_id and _run_exists(database_file, run_id):
             raise PipelineRunAlreadyExists(

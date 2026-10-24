@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from .database_config import require_sqlite_backend
+
 SCHEMA_VERSION = 1
 _RUN_STATUSES = {"running", "succeeded", "partial", "failed"}
 
@@ -85,6 +87,7 @@ def _connect(database_path: str | Path) -> sqlite3.Connection:
 
 def initialize_database(database_path: str | Path) -> None:
     """Create the database parent folder and schema, safely and idempotently."""
+    require_sqlite_backend(database_path)
     path = Path(database_path).expanduser()
     if str(path) == ":memory:":
         raise ValueError("Use a database file path; in-memory databases are connection-scoped here.")
@@ -198,6 +201,7 @@ def persist_audit_run(
         raise ValueError(f"run_status must be one of: {', '.join(sorted(_RUN_STATUSES))}.")
     if not input_filename:
         raise ValueError("input_filename must not be blank.")
+    require_sqlite_backend(database_path)
 
     checks = url_check_results or {}
     prepared = []

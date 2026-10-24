@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from .database import SCHEMA_VERSION, persist_audit_run
+from .database_config import DatabaseConfigurationError, require_sqlite_backend
 from .ingestion import IngestionError, load_podcast_file
 from .url_checker import UrlCheckResult, check_website_url
 from .validation import ValidationReport, validate_records
@@ -47,6 +48,10 @@ class AuditRunSummary:
 
 def validate_existing_database(path: Path) -> None:
     """Allow appending only to a readable database with this project's schema."""
+    try:
+        require_sqlite_backend(path)
+    except DatabaseConfigurationError as exc:
+        raise AuditRunnerError(str(exc)) from exc
     if not path.exists():
         return
     if not path.is_file():
