@@ -171,3 +171,22 @@ def test_podcast_record_filters_reject_unknown_mode(database_path):
     persist_audit_run(database_path, "empty.csv", [], audit_run_id="empty-filter")
     with pytest.raises(ValueError, match="Unsupported podcast record filter"):
         dashboard.get_podcast_records(database_path, "empty-filter", filter_mode="not-a-filter")
+
+
+def test_run_summary_exposes_sanitized_website_check_stage_state(tmp_path):
+    database_path = tmp_path / "website-stage.sqlite"
+    persist_audit_run(
+        database_path,
+        "one.csv",
+        [record(2, "one", url="https://one.test")],
+        audit_run_id="partial-checks",
+        metadata={"website_checking": {
+            "status": "partial", "unique_urls_checked": 4,
+            "unexpected_error_count": 1,
+        }},
+    )
+
+    summary = dashboard.get_run_summary(database_path, "partial-checks")
+    assert summary["website_check_status"] == "partial"
+    assert summary["website_check_unique_urls"] == 4
+    assert summary["website_check_unexpected_errors"] == 1

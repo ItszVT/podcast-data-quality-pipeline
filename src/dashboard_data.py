@@ -226,6 +226,20 @@ def get_run_summary(database_path: str | Path | bytes, audit_run_id: str) -> dic
         except (TypeError, json.JSONDecodeError):
             metadata = {}
         collection_report = metadata.get("collection_report") if isinstance(metadata, dict) else None
+        website = metadata.get("website_checking") if isinstance(metadata, dict) else None
+        website = website if isinstance(website, dict) else {}
+        website_status = website.get("status")
+        result["website_check_status"] = website_status if website_status in {"not_requested", "succeeded", "partial"} else "not_requested"
+        result["website_check_unique_urls"] = (
+            website.get("unique_urls_checked")
+            if isinstance(website.get("unique_urls_checked"), int) and not isinstance(website.get("unique_urls_checked"), bool) and website.get("unique_urls_checked") >= 0
+            else 0
+        )
+        result["website_check_unexpected_errors"] = (
+            website.get("unexpected_error_count")
+            if isinstance(website.get("unexpected_error_count"), int) and not isinstance(website.get("unexpected_error_count"), bool) and website.get("unexpected_error_count") >= 0
+            else 0
+        )
         rss_failures = collection_report.get("rss_retrieval_failures") if isinstance(collection_report, dict) else None
         result["rss_retrieval_failures"] = (
             rss_failures

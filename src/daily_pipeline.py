@@ -5,6 +5,7 @@ import argparse
 import json
 import sqlite3
 import sys
+import time
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -16,6 +17,7 @@ from .database import persist_audit_run
 from .database_config import require_sqlite_backend
 from .podcast_collector import SEARCH_TERMS, CollectionResult, CollectorConfig, collect_podcasts
 from .validation import ValidationReport, validate_records
+from .url_checker import INCONCLUSIVE, UrlCheckResult, UrlCheckerConfig, check_website_url
 
 DEFAULT_DATABASE_PATH = Path("data/real_podcast_audits.sqlite")
 INPUT_DESCRIPTION = "Apple iTunes Search API collection"
@@ -53,6 +55,9 @@ class PipelineSummary:
     finding_occurrences: int
     issue_counts: dict[str, int]
     stage_failures: tuple[str, ...]
+    website_check_status: str = "not_requested"
+    website_check_unique_urls: int = 0
+    website_check_records: int = 0
 
 
 def _run_exists(database_path: Path, run_id: str) -> bool:
@@ -91,6 +96,9 @@ def run_daily_pipeline(
     collector: Callable[..., CollectionResult] | None = None,
     validator: Callable[..., ValidationReport] | None = None,
     persister: Callable[..., str] | None = None,
+    check_websites: bool = False,
+    website_checker: Callable[..., UrlCheckResult] | None = None,
+    website_checker_config: UrlCheckerConfig | None = None,
 ) -> PipelineSummary:
     """Collect, validate, and persist a snapshot; findings are not run failures.
 
@@ -134,6 +142,11 @@ def run_daily_pipeline(
     issue_counts: dict[str, int] = {}
     records_with_findings = finding_occurrences = 0
     failures: list[str] = []
+    url_check_results: dict[int, UrlCheckResult] = {}
+    website_status = "not_requested"
+    website_unique_count = 0
+    website_stop_reason: str | None = None
+    website_unexpected_errors = 0
 
     try:
         result = collect_fn(settings, search_terms=terms)
@@ -170,6 +183,47 @@ def run_daily_pipeline(
     if collection_status == "failed":
         records_to_store = ()
 
+    if check_websites and validation_status == "succeeded" and collection_status != "failed":
+        website_status = "succeeded"
+        checker = website_checker or check_website_url
+        check_settings = website_checker_config or UrlCheckerConfig()
+        deadline = time.monotonic() + min(check_settings.stage_budget_seconds, 90.0)
+        candidates: dict[str, list[int]] = {}
+        for row in validation_report.records if validation_report else ():
+            if any(issue.category in {"blank_website_url", "malformed_url", "unsupported_url_scheme"} for issue in row.issues):
+                continue
+            candidate = row.normalized.get("normalized_website_url")
+            if candidate:
+                candidates.setdefault(str(candidate), []).append(row.source_row)
+        for candidate, source_rows in candidates.items():
+            if website_unique_count >= 20:
+                website_status, website_stop_reason = "partial", "unique_url_limit_reached"
+                break
+            if time.monotonic() >= deadline:
+                website_status, website_stop_reason = "partial", "stage_budget_exhausted"
+                break
+            try:
+                result = checker(candidate, check_settings, deadline_monotonic=deadline)
+                if not isinstance(result, UrlCheckResult):
+                    raise TypeError
+            except Exception:
+                # Checker exceptions may embed URLs or environment details.
+                # Persist only a fixed category and fixed evidence.
+                website_unexpected_errors += 1
+                website_status = "partial"
+                result = UrlCheckResult(
+                    original_url=candidate, final_url=None, http_status_code=None,
+                    redirect_count=0, redirect_chain=(), response_time_ms=None,
+                    classification=INCONCLUSIVE,
+                    evidence="The website check could not be completed safely.",
+                    error_reason="checker_error",
+                )
+            website_unique_count += 1
+            for source_row in source_rows:
+                url_check_results[source_row] = result
+        if website_unexpected_errors and website_stop_reason is None:
+            website_stop_reason = "checker_error"
+
     run_status = (
         "failed" if collection_status == "failed" or validation_status == "failed"
         else "partial" if collection_status == "partial"
@@ -185,6 +239,7 @@ def run_daily_pipeline(
             # The row itself is atomic: if this transaction commits, the saved
             # audit proves persistence succeeded; if not, no run row is left.
             "persistence": "succeeded",
+            "website_checking": website_status,
         },
         "collection_report": collection_report,
         "records_collected": len(collected),
@@ -192,6 +247,14 @@ def run_daily_pipeline(
         "records_with_findings": records_with_findings,
         "finding_occurrences": finding_occurrences,
         "issue_counts": issue_counts,
+        "website_checking": {
+            "requested": check_websites,
+            "status": website_status,
+            "unique_urls_checked": website_unique_count,
+            "records_with_results": len(url_check_results),
+            "unexpected_error_count": website_unexpected_errors,
+            "stop_reason": website_stop_reason,
+        },
     }
 
     try:
@@ -200,6 +263,7 @@ def run_daily_pipeline(
             audit_run_id=run_id, started_at=started_at, completed_at=completed_at,
             run_status=run_status, error_summary="; ".join(failures) or None,
             metadata=metadata, schema_issues=schema_issues,
+            url_check_results=url_check_results,
         )
         persistence_status = "succeeded"
         records_stored = len(records_to_store)
@@ -223,6 +287,9 @@ def run_daily_pipeline(
         records_stored=records_stored, records_with_findings=records_with_findings,
         finding_occurrences=finding_occurrences, issue_counts=issue_counts,
         stage_failures=tuple(failures),
+        website_check_status=website_status,
+        website_check_unique_urls=website_unique_count,
+        website_check_records=len(url_check_results),
     )
 
 
@@ -271,6 +338,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--max-redirects", type=_nonnegative_int, default=3)
     parser.add_argument("--api-pacing-seconds", type=_nonnegative_float, default=3.0)
     parser.add_argument("--rss-pacing-seconds", type=_nonnegative_float, default=0.4)
+    parser.add_argument("--check-websites", action="store_true", help="Check up to 20 unique validated website URLs (bounded network requests).")
     args = parser.parse_args(argv)
     if args.search_terms and any(not term.strip() for term in args.search_terms):
         parser.error("--search-term values must not be blank")
@@ -285,6 +353,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         summary = run_daily_pipeline(
             args.database, config=config, search_terms=args.search_terms, audit_run_id=args.run_id,
+            check_websites=args.check_websites,
         )
     except PipelinePreflightError as exc:
         print(json.dumps({

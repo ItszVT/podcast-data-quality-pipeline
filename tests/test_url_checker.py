@@ -41,6 +41,17 @@ class ControlledHandler(BaseHTTPRequestHandler):
         elif self.path == "/slow":
             time.sleep(0.25)
             self._respond(200, "<html><title>Slow</title></html>")
+        elif self.path == "/slow-stream":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            try:
+                for _ in range(10):
+                    self.wfile.write(b"x")
+                    self.wfile.flush()
+                    time.sleep(0.04)
+            except OSError:
+                pass
         elif self.path == "/large":
             self._respond(200, "x" * 2048)
         elif self.path == "/large-streamed":
@@ -83,18 +94,11 @@ def local_server(monkeypatch):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
 
-    # Test-only DNS seam: mark the controlled loopback target as publicly
-    # resolvable for the safety gate, while Requests still connects only to the
-    # local server encoded in the test URL. Production code has no bypass flag.
-    actual_resolver = url_checker._resolve_host
-
-    def controlled_resolver(host, port):
-        if host == "127.0.0.1":
-            return ["93.184.216.34"]
-        return actual_resolver(host, port)
-
-    monkeypatch.setattr(url_checker, "_resolve_host", controlled_resolver)
-    yield f"http://127.0.0.1:{server.server_port}"
+    # Test-only seam approves the fixture's loopback address. The transport
+    # connects to exactly this resolved address; production has no bypass.
+    monkeypatch.setattr(url_checker, "_resolve_host", lambda host, port, timeout: [host] if host.startswith("127.") else ["127.0.0.1"] if host == "podcast.test" else [])
+    monkeypatch.setattr(url_checker, "_is_public_address", lambda address: address == "127.0.0.1")
+    yield f"http://podcast.test:{server.server_port}"
     server.shutdown()
     server.server_close()
     thread.join(timeout=2)
@@ -151,20 +155,36 @@ def test_redirect_to_private_address_is_blocked_before_request(local_server):
 
 
 def test_read_timeout_is_inconclusive(local_server):
+    started = time.monotonic()
     result = check_website_url(
         f"{local_server}/slow",
-        UrlCheckerConfig(connect_timeout_seconds=1, read_timeout_seconds=0.05),
+        UrlCheckerConfig(connect_timeout_seconds=1, request_timeout_seconds=0.05),
     )
     assert result.classification == INCONCLUSIVE
     assert result.error_reason == "timeout"
+    assert time.monotonic() - started < 0.5
+
+
+def test_total_timeout_aborts_slow_stream(local_server):
+    started = time.monotonic()
+    result = check_website_url(
+        f"{local_server}/slow-stream",
+        UrlCheckerConfig(connect_timeout_seconds=1, request_timeout_seconds=0.12),
+    )
+    assert result.classification == INCONCLUSIVE
+    assert result.error_reason == "timeout"
+    assert time.monotonic() - started < 0.5
 
 
 def test_connection_failure_is_inconclusive(monkeypatch):
-    monkeypatch.setattr(url_checker, "_resolve_host", lambda _host, _port: ["8.8.8.8"])
-    def fail_connection(*_args, **_kwargs):
-        raise url_checker.requests.ConnectionError("controlled failure")
+    monkeypatch.setattr(url_checker, "_resolve_host", lambda _host, _port, _timeout: ["8.8.8.8"])
+    class FailingSession:
+        def __init__(self, **_kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def get(self, *_args, **_kwargs): raise url_checker.RequestException("controlled failure")
 
-    monkeypatch.setattr(url_checker.requests.Session, "get", fail_connection)
+    monkeypatch.setattr(url_checker, "CurlSession", FailingSession)
     result = check_website_url("https://podcast.example/unavailable")
     assert result.classification == INCONCLUSIVE
     assert result.error_reason == "connection_error"
@@ -196,7 +216,7 @@ def test_prohibited_destinations_are_rejected(url):
 
 
 def test_hostname_with_mixed_public_and_private_dns_answers_is_rejected(monkeypatch):
-    monkeypatch.setattr(url_checker, "_resolve_host", lambda _host, _port: ["8.8.8.8", "10.0.0.4"])
+    monkeypatch.setattr(url_checker, "_resolve_host", lambda _host, _port, _timeout: ["8.8.8.8", "10.0.0.4"])
     result = check_website_url("https://podcast.example/website")
     assert result.classification == INCONCLUSIVE
     assert result.error_reason == "prohibited_ip_destination"
@@ -204,11 +224,89 @@ def test_hostname_with_mixed_public_and_private_dns_answers_is_rejected(monkeypa
 
 
 def test_https_scheme_is_accepted_by_url_safety_validation(monkeypatch):
-    monkeypatch.setattr(url_checker, "_resolve_host", lambda _host, _port: ["8.8.8.8"])
+    monkeypatch.setattr(url_checker, "_resolve_host", lambda _host, _port, _timeout: ["8.8.8.8"])
     normalized, safety_error, input_error = url_checker._validate_destination("https://podcast.example/")
     assert normalized == "https://podcast.example/"
     assert safety_error is None
     assert input_error is None
+
+
+def test_dns_result_is_pinned_and_original_hostname_keeps_tls_verification(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(url_checker, "_resolve_host", lambda *_args: ["8.8.8.8"])
+
+    class Response:
+        status_code = 200
+        headers = {"Content-Type": "text/html"}
+
+    class Session:
+        def __init__(self, **kwargs):
+            captured["session"] = kwargs
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def get(self, url, **kwargs):
+            captured["url"] = url
+            captured["request"] = kwargs
+            kwargs["content_callback"](b"<title>Safe</title>")
+            return Response()
+
+    monkeypatch.setattr(url_checker, "CurlSession", Session)
+    result = check_website_url("https://podcast.example/path")
+
+    assert result.classification == LIKELY_WORKING
+    assert captured["url"] == "https://podcast.example/path"
+    options = captured["session"]["curl_options"]
+    assert options[url_checker.CurlOpt.RESOLVE] == ["podcast.example:443:8.8.8.8"]
+    assert options[url_checker.CurlOpt.SSL_VERIFYPEER] == 1
+    assert options[url_checker.CurlOpt.SSL_VERIFYHOST] == 2
+    assert captured["session"]["verify"] is True
+    assert captured["session"]["trust_env"] is False
+    assert captured["session"]["allow_redirects"] is False
+
+
+def test_certificate_validation_failure_is_safely_classified(monkeypatch):
+    monkeypatch.setattr(url_checker, "_resolve_host", lambda *_args: ["8.8.8.8"])
+
+    class Session:
+        def __init__(self, **_kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def get(self, *_args, **_kwargs):
+            raise url_checker.CertificateVerifyError("raw host and certificate details")
+
+    monkeypatch.setattr(url_checker, "CurlSession", Session)
+    result = check_website_url("https://podcast.example/private-token")
+    assert result.classification == INCONCLUSIVE
+    assert result.error_reason == "tls_verification_failed"
+    assert "podcast.example" not in result.evidence
+    assert "private-token" not in result.evidence
+    assert "raw host" not in result.evidence
+
+
+def test_late_dns_rebinding_cannot_change_the_pinned_connection(local_server, monkeypatch):
+    answers = 0
+
+    def changing_answers(*_args):
+        nonlocal answers
+        answers += 1
+        return ["127.0.0.1"] if answers == 1 else ["10.0.0.9"]
+
+    monkeypatch.setattr(url_checker, "_resolve_host", changing_answers)
+    monkeypatch.setattr(url_checker, "_is_public_address", lambda address: address == "127.0.0.1")
+    result = check_website_url(f"{local_server}/ok")
+
+    assert result.classification == LIKELY_WORKING
+    assert answers == 1
+
+
+def test_expired_stage_deadline_starts_no_request(monkeypatch):
+    monkeypatch.setattr(url_checker, "_resolve_host", lambda *_args: pytest.fail("DNS should not run"))
+    result = check_website_url(
+        "https://podcast.example/",
+        deadline_monotonic=time.monotonic() - 1,
+    )
+    assert result.classification == INCONCLUSIVE
+    assert result.error_reason == "check_budget_exhausted"
 
 
 @pytest.mark.parametrize("path", ["/large", "/large-streamed"])

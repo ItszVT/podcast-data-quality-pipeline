@@ -15,6 +15,7 @@ from src.daily_pipeline import (
     run_daily_pipeline,
 )
 from src.podcast_collector import CollectionResult, CollectorConfig
+from src.url_checker import INCONCLUSIVE, LIKELY_WORKING, UrlCheckResult
 
 
 def collection(records, **report_overrides):
@@ -75,6 +76,72 @@ def test_successful_pipeline_persists_validation_findings_without_failing(tmp_pa
         metadata = json.loads(run["metadata_json"])
         assert metadata["stages"]["collection"] == "succeeded"
         assert metadata["stages"]["validation"] == "succeeded"
+
+
+def test_opt_in_website_checks_are_deduplicated_and_persisted(tmp_path):
+    database = tmp_path / "website-checks.sqlite"
+    calls = []
+
+    def checker(url, _config, *, deadline_monotonic):
+        calls.append((url, deadline_monotonic))
+        return UrlCheckResult(url, url, 200, 0, (), 1.0, LIKELY_WORKING, "HTTP 200")
+
+    result = run_daily_pipeline(
+        database,
+        collector=lambda *_args, **_kwargs: collection([
+            record("one"), record("two"), record("three", website="https://other.example")
+        ]),
+        audit_run_id="website-check-run",
+        check_websites=True,
+        website_checker=checker,
+    )
+
+    assert result.pipeline_status == "succeeded"
+    assert result.website_check_status == "succeeded"
+    assert result.website_check_unique_urls == 2
+    assert result.website_check_records == 3
+    assert len(calls) == 2
+    with read_database(database) as db:
+        rows = db.execute("SELECT original_url, classification FROM url_checks ORDER BY original_url, url_check_id").fetchall()
+        assert [(row[0], row[1]) for row in rows] == [
+            ("https://other.example", LIKELY_WORKING),
+            ("https://show.example", LIKELY_WORKING),
+            ("https://show.example", LIKELY_WORKING),
+        ]
+        metadata = json.loads(db.execute("SELECT metadata_json FROM audit_runs").fetchone()[0])
+        assert metadata["website_checking"]["unique_urls_checked"] == 2
+
+
+def test_website_check_limit_and_checker_error_are_recorded_safely(tmp_path):
+    database = tmp_path / "bounded-checks.sqlite"
+    records = [record(f"show-{index}", website=f"https://show-{index}.example") for index in range(22)]
+    calls = []
+
+    def checker(url, _config, *, deadline_monotonic):
+        calls.append(url)
+        if url.endswith("0.example"):
+            raise RuntimeError("sensitive URL and token should not be saved")
+        return UrlCheckResult(url, None, None, 0, (), 1.0, INCONCLUSIVE, "Request failed safely", "connection_error")
+
+    result = run_daily_pipeline(
+        database,
+        collector=lambda *_args, **_kwargs: collection(records),
+        audit_run_id="bounded-check-run",
+        check_websites=True,
+        website_checker=checker,
+    )
+
+    assert result.pipeline_status == "succeeded"
+    assert result.website_check_status == "partial"
+    assert result.website_check_unique_urls == 20
+    assert result.website_check_records == 20
+    assert len(calls) == 20
+    with read_database(database) as db:
+        metadata = json.loads(db.execute("SELECT metadata_json FROM audit_runs").fetchone()[0])
+        assert metadata["website_checking"]["stop_reason"] == "unique_url_limit_reached"
+        saved = " ".join(str(value) for row in db.execute("SELECT result_json FROM url_checks") for value in row)
+        assert "sensitive URL" not in saved
+        assert "token" not in saved
 
 
 def test_empty_collection_is_a_successful_zero_record_snapshot(tmp_path):

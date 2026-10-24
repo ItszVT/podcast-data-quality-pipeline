@@ -150,7 +150,7 @@ jobs:
           }
 
           pipeline_exit=0
-          if python -m src.daily_pipeline --database "$SNAPSHOT_FILE" > "$RUNNER_TEMP/audit-output.json" 2>&1; then
+          if python -m src.daily_pipeline --database "$SNAPSHOT_FILE" --check-websites > "$RUNNER_TEMP/audit-output.json" 2>&1; then
             pipeline_exit=0
           else
             pipeline_exit=$?

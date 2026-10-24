@@ -265,8 +265,13 @@ if section == "Overview":
     st.write("Findings include both action items and completeness notes. Review the priority and affected records before deciding what to change.")
     _render_findings(db_path, selected_run)
     st.subheader("Website checks")
+    if summary.get("website_check_status") == "partial":
+        st.warning(f"Website checking completed partially. {summary.get('website_check_unique_urls', 0)} unique URLs were checked; additional URLs may have been skipped after reaching the request limit or encountering checker errors. Review saved outcomes in Website checks.")
     if summary["url_check_count"] == 0:
-        st.info("**No websites checked yet**\n\nThe audit reviewed the available data, but it has not tested whether publisher websites are reachable. This is not a failure. Website checks have not been run for this audit.", icon=":material/info:")
+        if summary.get("website_check_status") == "not_requested":
+            st.info("**No websites checked yet**\n\nWebsite checks were not requested for this audit.", icon=":material/info:")
+        else:
+            st.warning("Website checks were requested, but no results were saved.")
     else:
         st.caption(f"{summary['url_check_count']} saved website checks are available. Open Website checks for results and details.")
 
@@ -319,8 +324,13 @@ elif section == "Website checks":
     st.header("Website checks")
     st.write("Website reachability checks are separate from reviewing the data fields. Opening this dashboard never sends a request to a publisher website.")
     outcomes = data.get_url_outcomes(db_path, selected_run)
+    if summary.get("website_check_status") == "partial":
+        st.warning(f"Website checking completed partially. {summary.get('website_check_unique_urls', 0)} unique URLs were checked; {summary.get('website_check_unexpected_errors', 0)} checker error(s) were safely recorded as inconclusive. Additional URLs may have been skipped after reaching the request limit or stage deadline.")
     if not outcomes:
-        st.info("**No websites checked yet**\n\nThe audit has reviewed the available data, but it has not tested whether publisher websites are reachable.\n\nThis is not a failure. Website checks have not been run for this audit.", icon=":material/info:")
+        if summary.get("website_check_status") == "not_requested":
+            st.info("**No websites checked yet**\n\nWebsite checks were not requested for this audit.", icon=":material/info:")
+        else:
+            st.warning("Website checks were requested, but no results were saved. This can happen when there are no eligible website URLs.")
     else:
         outcome_rows = [{"Website check result": CLASSIFICATION_LABELS.get(row["classification"], row["classification"].replace("_", " ").title()), "Checks": row["record_count"], "Share of checks (%)": row["checked_pct"]} for row in outcomes]
         st.bar_chart(pd.DataFrame(outcome_rows), x="Website check result", y="Checks", horizontal=True, sort="-Checks", alt="Saved website check results by outcome")
