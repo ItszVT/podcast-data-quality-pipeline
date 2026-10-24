@@ -76,6 +76,57 @@ jobs:
         run: |
           set -euo pipefail
           if ! python -m src.daily_pipeline --database "$SNAPSHOT_FILE" > "$RUNNER_TEMP/audit-output.json" 2>&1; then
+            python - "$RUNNER_TEMP/audit-output.json" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          try:
+              result = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+              if not isinstance(result, dict):
+                  raise ValueError("unexpected summary")
+          except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+              print("Audit execution failed; sanitized_category=cli_or_runtime.")
+          else:
+              allowed_statuses = {"succeeded", "partial", "failed", "skipped", "not_started"}
+              fields = (
+                  "pipeline_status", "preflight_status", "collection_status",
+                  "validation_status", "persistence_status",
+              )
+              statuses = {}
+              for name in fields:
+                  value = result.get(name)
+                  if isinstance(value, str) and value in allowed_statuses:
+                      statuses[name] = value
+              categories = []
+              if statuses.get("preflight_status") == "failed":
+                  categories.append("preflight")
+              if statuses.get("collection_status") in {"partial", "failed"}:
+                  stage_failures = result.get("stage_failures", [])
+                  collection_categories = []
+                  if isinstance(stage_failures, list):
+                      for failure in stage_failures:
+                          if not isinstance(failure, str):
+                              continue
+                          if failure.startswith("collection partial (API search):"):
+                              collection_categories.append("collection_api_search")
+                          elif failure.startswith("collection partial (RSS metadata):"):
+                              collection_categories.append("collection_rss_metadata")
+                  categories.extend(collection_categories or ["collection"])
+              if statuses.get("validation_status") == "failed":
+                  categories.append("validation")
+              if statuses.get("persistence_status") == "failed":
+                  categories.append("persistence")
+              if not categories:
+                  categories.append("cli_or_runtime")
+              details = ", ".join(f"{key}={value}" for key, value in statuses.items())
+              print(
+                  "Audit execution failed; "
+                  f"sanitized_category={'+'.join(categories)}"
+                  + (f"; {details}" if details else "")
+                  + "."
+              )
+          PY
             echo "The real audit did not complete successfully; snapshot publication was skipped."
             exit 1
           fi
