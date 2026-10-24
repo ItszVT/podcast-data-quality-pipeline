@@ -1,0 +1,88 @@
+name: Experiment RSS response-size caps
+
+on:
+  workflow_dispatch:
+    inputs:
+      audit_run_id:
+        description: Exact audit_run_id containing the 50 podcast records to compare
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: experiment-rss-response-size
+  cancel-in-progress: false
+
+jobs:
+  compare-response-caps:
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      SNAPSHOT_BRANCH: audit-snapshots
+      SNAPSHOT_FILE: data/real_podcast_audits.sqlite
+      AUDIT_RUN_ID: ${{ inputs.audit_run_id }}
+
+    steps:
+      - name: Check out pipeline source
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set temporary snapshot path
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'TEMP_DATABASE=%s\n' "$RUNNER_TEMP/rss-cap-experiment.sqlite" >> "$GITHUB_ENV"
+
+      - name: Install pipeline dependencies
+        run: >-
+          python -m pip install
+          --disable-pip-version-check
+          --no-input
+          -r requirements.txt
+
+      - name: Restore published snapshot to temporary runner storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "refs/heads/${SNAPSHOT_BRANCH}:refs/remotes/origin/${SNAPSHOT_BRANCH}"
+          mapfile -t tracked_files < <(git ls-tree -r --name-only "origin/${SNAPSHOT_BRANCH}")
+          if [[ "${#tracked_files[@]}" -ne 1 || "${tracked_files[0]}" != "$SNAPSHOT_FILE" ]]; then
+            echo "Published snapshot branch file set is unexpected; experiment stopped."
+            exit 1
+          fi
+          if ! git show "origin/${SNAPSHOT_BRANCH}:${SNAPSHOT_FILE}" > "$TEMP_DATABASE"; then
+            echo "Published snapshot could not be restored; experiment stopped."
+            exit 1
+          fi
+          python - <<'PY'
+          import os
+          import sqlite3
+
+          uri = "file:" + os.environ["TEMP_DATABASE"] + "?mode=ro"
+          with sqlite3.connect(uri, uri=True) as connection:
+              integrity = connection.execute("PRAGMA integrity_check").fetchone()
+          if integrity != ("ok",):
+              raise SystemExit("Temporary snapshot integrity check failed.")
+          PY
+          echo "Snapshot restored in temporary runner storage and passed SQLite integrity check."
+
+      - name: Run paired RSS cap experiment
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Hard virtual-memory ceiling; the experiment also records sampled RSS
+          # per cap and stops further fetches if its 512 MiB RSS budget is crossed.
+          ulimit -v 1048576
+          python -m src.rss_size_experiment \
+            --database "$TEMP_DATABASE" \
+            --audit-run-id "$AUDIT_RUN_ID" | tee -a "$GITHUB_STEP_SUMMARY"
