@@ -136,16 +136,19 @@ def test_collection_maps_api_metadata_deduplicates_and_enriches_from_rss():
 
 
 def test_failed_rss_keeps_api_record_and_reports_failure():
+    sensitive_url = "https://feed.invalid/rss?token=do-not-persist"
     result = collect_podcasts(
         CollectorConfig(api_pacing_seconds=0, rss_pacing_seconds=0),
-        api_search=lambda *_: [{"collectionId": 12, "collectionName": "Retained", "feedUrl": "https://feed.invalid/rss"}],
-        rss_fetcher=lambda *_: (_ for _ in ()).throw(CollectionError("fixture failure")),
+        api_search=lambda *_: [{"collectionId": 12, "collectionName": "Retained", "feedUrl": sensitive_url}],
+        rss_fetcher=lambda *_: (_ for _ in ()).throw(CollectionError(f"request failed for {sensitive_url}")),
         sleeper=lambda _: None, search_terms=("one",),
     )
     assert len(result.records) == 1
     assert result.records[0]["title"] == "Retained"
     assert result.records[0]["website_url"] == ""
     assert result.report["rss_retrieval_failures"] == 1
+    assert result.report["rss_errors"] == ["itunes:collection:12: CollectionError"]
+    assert sensitive_url not in repr(result.report)
 
 
 def test_write_collection_creates_expected_csv_and_refuses_overwrite(tmp_path):

@@ -15,6 +15,7 @@ from typing import Any, Callable, Sequence
 from .audit_runner import AuditRunnerError, validate_existing_database
 from .database import persist_audit_run
 from .database_config import require_sqlite_backend
+from .geo_intelligence import build_geo_intelligence, classify_episode_languages
 from .podcast_collector import SEARCH_TERMS, CollectionResult, CollectorConfig, collect_podcasts
 from .validation import ValidationReport, validate_records
 from .url_checker import INCONCLUSIVE, UrlCheckResult, UrlCheckerConfig, check_website_url
@@ -230,6 +231,18 @@ def run_daily_pipeline(
         else "succeeded"
     )
     completed_at = datetime.now(timezone.utc).isoformat()
+    # Analyze bounded RSS episode text in memory. Persist only language labels,
+    # counts, and method evidence; never copy episode text into the audit JSON.
+    episode_samples = collection_report.pop("episode_text_samples_by_feed", {})
+    if isinstance(episode_samples, dict):
+        collection_report["episode_language_evidence"] = {
+            str(feed_id): classify_episode_languages(samples)
+            for feed_id, samples in episode_samples.items()
+            if isinstance(samples, (list, tuple))
+        }
+    geo_intelligence = build_geo_intelligence(
+        database_file, collected, collection_report, completed_at
+    )
     metadata = {
         "pipeline": "daily_collection",
         "stages": {
@@ -242,6 +255,7 @@ def run_daily_pipeline(
             "website_checking": website_status,
         },
         "collection_report": collection_report,
+        "geo_intelligence": geo_intelligence,
         "records_collected": len(collected),
         "records_validated": validation_report.total_rows if validation_report else 0,
         "records_with_findings": records_with_findings,

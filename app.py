@@ -15,7 +15,7 @@ data = reload(data)
 
 st.set_page_config(page_title="Podcast Data Quality", layout="wide")
 
-SECTIONS = ["Overview", "What needs attention", "Podcast records", "Website checks", "Audit history", "Evaluation"]
+SECTIONS = ["Overview", "What needs attention", "Podcast records", "Website checks", "Geo Intelligence", "Audit history", "Evaluation"]
 FIELD_LABELS = {
     "feed_id": "Podcast ID",
     "title": "Podcast title",
@@ -360,6 +360,77 @@ elif section == "Website checks":
             detail_rows = [{"Podcast": r["title"], "Original website": r["original_url"], "Final website": r["final_url"] or "Not reached", "Evidence": r["evidence"], "Reason code": r["error_reason"] or "—"} for r in checks]
             if detail_rows:
                 st.dataframe(pd.DataFrame(detail_rows), hide_index=True, alt="Technical evidence for saved website checks")
+
+elif section == "Geo Intelligence":
+    st.header("Geo Intelligence")
+    st.write("This view reports explicit metadata claims and repeated language evidence. It does not infer podcast origin from language, website domains, or the Apple storefront.")
+    geo = data.get_geo_intelligence(db_path, selected_run)
+    if not geo:
+        st.info("No geographic observations were saved for this audit. Run a new audit to build evidence from available metadata.")
+    else:
+        storefront = geo.get("storefront_context", {})
+        st.caption(f"Apple storefront: {storefront.get('value', 'Not recorded')} — {storefront.get('source', 'source not recorded')}. This identifies the catalog searched only.")
+        records_geo = geo.get("records", [])
+        identity_rows = []
+        language_rows = []
+        for item in records_geo:
+            identity = item.get("identity", {})
+            language = identity.get("language", {})
+            episode = language.get("episode_observation", {})
+            location = identity.get("publisher_location_claims", [])
+            audience = identity.get("intended_audience_claims", [])
+            identity_rows.append({
+                "Podcast": item.get("title", "Untitled podcast"),
+                "Podcast origin": "Unknown" if identity.get("podcast_country_of_origin", {}).get("value") is None else identity["podcast_country_of_origin"]["value"],
+                "Declared publisher country": identity.get("declared_publisher_country", {}).get("value") or "Unknown",
+                "Publisher location claims": "; ".join(f"{claim.get('country_name')} — {claim.get('source')} ({claim.get('confidence')})" for claim in location) or "None found",
+                "Intended audience claims": "; ".join(f"{claim.get('country_name')} — {claim.get('source')} ({claim.get('confidence')})" for claim in audience) or "None found",
+            })
+            language_rows.append({
+                "Podcast": item.get("title", "Untitled podcast"),
+                "Declared language": language.get("declared") or "Not recorded",
+                "Episode language observation": ", ".join(episode.get("languages", [])) or episode.get("status", "undetermined").replace("_", " ").title(),
+                "Evidence": episode.get("evidence_source", "No episode language evidence"),
+            })
+        if identity_rows:
+            st.subheader("Geographic identity evidence")
+            st.dataframe(pd.DataFrame(identity_rows), hide_index=True, alt="Explicit geographic identity evidence and unknown origin values")
+        conflicts = geo.get("identity_conflicts", [])
+        if conflicts:
+            st.subheader("Identity conflicts to review")
+            st.warning("These are conflicting source claims, not verified errors.")
+            st.dataframe(pd.DataFrame([{"Podcast": item.get("title"), "Evidence": item.get("geographic_identity_conflict", {}).get("evidence")} for item in conflicts]), hide_index=True, alt="Potential geographic identity conflicts with source evidence")
+        else:
+            st.info("No supported geographic identity conflict was found in the available records.")
+        if language_rows:
+            st.subheader("Language intelligence")
+            st.dataframe(pd.DataFrame(language_rows), hide_index=True, alt="Declared language compared with RSS episode language evidence")
+        inconsistencies = geo.get("language_inconsistencies", [])
+        if inconsistencies:
+            st.warning("Some repeated episode-language observations differ from declared metadata; review the source before changing it.")
+            st.dataframe(pd.DataFrame([{"Podcast": item.get("title"), "Evidence": item.get("language_inconsistency", {}).get("evidence")} for item in inconsistencies]), hide_index=True, alt="Potential declared and observed language differences")
+        st.subheader("Geographic and language changes")
+        drift = geo.get("drift", [])
+        changes = [row for row in drift if row.get("change_classification") in {"changed", "missing_or_unavailable", "first_observation"}]
+        if changes:
+            labels = {"changed": "Changed", "missing_or_unavailable": "Missing or unavailable now", "first_observation": "First observation"}
+            st.dataframe(pd.DataFrame([{
+                "Podcast": row.get("title"), "Field": row.get("field", "").replace("_", " ").title(),
+                "Previous": row.get("previous_value") if row.get("previous_value") not in (None, [], "") else "Not recorded",
+                "Current": row.get("current_value") if row.get("current_value") not in (None, [], "") else "Not recorded",
+                "Change": labels.get(row.get("change_classification"), "Not observed"),
+                "First observation": row.get("first_observation"), "Latest observation": row.get("latest_observation"),
+            } for row in changes]), hide_index=True, alt="Historical changes in geographic and language metadata")
+        else:
+            st.info("No supported changes are available yet. Missing data is not counted as a change.")
+        st.subheader("Regional website reliability")
+        regional = geo.get("regional_website_reliability", {})
+        observations = regional.get("observations", [])
+        if observations:
+            st.dataframe(pd.DataFrame(observations), hide_index=True, alt="Verified regional website reliability observations")
+        else:
+            st.info("Not tested. No authorized regional probe with a verified exit country is configured. The standard audit runner's location is not treated as a country observation.")
+            st.caption("A future probe observation must include: " + ", ".join(regional.get("required_observation_fields", [])))
 
 elif section == "Audit history":
     st.header("Audit history")

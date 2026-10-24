@@ -47,12 +47,12 @@ def controlled_reference_server(monkeypatch):
     thread.start()
     real_resolver = url_checker._resolve_host
 
-    def permit_only_fixture_listener(host, port):
+    def permit_only_fixture_listener(host, port, timeout_seconds):
         if host == "127.0.0.1" and port == server.server_port:
             # Only the safety lookup is narrowed to this fixture's bound port;
             # Requests still makes its real request to the loopback test server.
             return ["93.184.216.34"]
-        return real_resolver(host, port)
+        return real_resolver(host, port, timeout_seconds)
 
     monkeypatch.setattr(url_checker, "_resolve_host", permit_only_fixture_listener)
     yield f"http://127.0.0.1:{server.server_port}"

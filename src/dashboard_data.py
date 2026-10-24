@@ -256,6 +256,23 @@ def get_run_summary(database_path: str | Path | bytes, audit_run_id: str) -> dic
         return result
 
 
+def get_geo_intelligence(database_path: str | Path | bytes, audit_run_id: str) -> dict[str, Any]:
+    """Read the selected run's saved geo observations without network access."""
+    with _read_connection(database_path) as connection:
+        row = connection.execute(
+            "SELECT metadata_json FROM audit_runs WHERE audit_run_id = ?",
+            (audit_run_id,),
+        ).fetchone()
+        if row is None:
+            return {}
+        try:
+            metadata = json.loads(row["metadata_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            return {}
+        geo = metadata.get("geo_intelligence", {}) if isinstance(metadata, dict) else {}
+        return geo if isinstance(geo, dict) else {}
+
+
 def get_issue_counts(database_path: str | Path | bytes, audit_run_id: str) -> list[dict[str, Any]]:
     """Count validation issue occurrences by category and severity for a run."""
     query = """
