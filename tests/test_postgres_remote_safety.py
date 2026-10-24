@@ -160,6 +160,41 @@ def test_configuration_errors_never_echo_credentials_or_full_url():
     assert secret_url not in str(error.value)
 
 
+@pytest.mark.parametrize(
+    "error, expected",
+    [
+        (type("DriverError", (Exception,), {"sqlstate": "08001"})
+         ("postgresql://user:secret@private.example/db connection failed"), "PostgreSQL connection failure."),
+        (type("OperationalError", (Exception,), {})
+         ("password authentication failed for user secret at private.example"), "PostgreSQL authentication failed."),
+        (type("OperationalError", (Exception,), {})
+         ("certificate verify failed for private.example"), "PostgreSQL TLS verification failed."),
+        (type("OperationalError", (Exception,), {})
+         ("could not translate host name private.example"), "PostgreSQL host name could not be resolved."),
+        (type("OperationalError", (Exception,), {})
+         ("connection timed out to private.example"), "PostgreSQL network connection failed."),
+        (type("DatabaseError", (Exception,), {"sqlstate": "3D000"})
+         ("database db does not exist at private.example"), "PostgreSQL database access failed."),
+    ],
+)
+def test_connection_failures_use_safe_classifications_without_connection_details(error, expected):
+    target = resolve_test_target(remote_env())
+
+    class FakePsycopg:
+        @staticmethod
+        def connect(*_args, **_kwargs):
+            raise error
+
+    with pytest.raises(DatabaseTestSafetyError) as caught:
+        open_verified_connection(FakePsycopg, target)
+
+    message = str(caught.value)
+    assert message == expected
+    assert "secret" not in message
+    assert "private.example" not in message
+    assert "postgresql://" not in message
+
+
 def test_cleanup_refuses_to_drop_schema_other_than_fixture_owned_name():
     class FakeSQL:
         @staticmethod

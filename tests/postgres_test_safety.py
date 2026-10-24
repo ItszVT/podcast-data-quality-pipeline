@@ -110,6 +110,48 @@ def close_quietly(connection) -> None:
         pass
 
 
+def _connection_error_message(exc: BaseException) -> str:
+    """Return a fixed, non-sensitive diagnostic selected from exception metadata."""
+    seen: set[int] = set()
+    pending: list[BaseException] = [exc]
+    sqlstates: list[str] = []
+    hints: list[str] = []
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        for attribute in ("sqlstate", "pgcode"):
+            value = getattr(current, attribute, None)
+            if isinstance(value, str):
+                sqlstates.append(value)
+        hints.append(type(current).__name__.casefold())
+        # Driver exception text is inspected only for known diagnostic markers;
+        # it is never returned, interpolated, or attached as a cause.
+        hints.append(str(current).casefold())
+        for attribute in ("__cause__", "__context__"):
+            nested = getattr(current, attribute, None)
+            if isinstance(nested, BaseException):
+                pending.append(nested)
+
+    if any(state.startswith("08") for state in sqlstates):
+        return "PostgreSQL connection failure."
+    text = " ".join(hints)
+    if any(token in text for token in ("password", "authentication", "invalid_authorization", "28p01", "28000")):
+        return "PostgreSQL authentication failed."
+    if any(token in text for token in ("ssl", "tls", "certificate", "cert verification", "sslerror")):
+        return "PostgreSQL TLS verification failed."
+    if any(token in text for token in ("getaddrinfo", "name or service not known", "name resolution", "nodename nor servname", "dns", "could not translate host")):
+        return "PostgreSQL host name could not be resolved."
+    if any(token in text for token in ("timeout", "timed out", "connection refused", "network is unreachable", "no route to host", "connection reset", "operationalerror")):
+        return "PostgreSQL network connection failed."
+    if any(state.startswith(("3d", "42")) for state in sqlstates) or any(
+        token in text for token in ("database", "does not exist", "permission denied", "not authorized", "insufficient_privilege", "3d000", "42501")
+    ):
+        return "PostgreSQL database access failed."
+    return "Could not connect to the configured PostgreSQL test database; details omitted."
+
+
 def open_verified_connection(psycopg, target: TestDatabaseTarget):
     """Verify server identity and transport encryption before schema changes."""
     options = {"connect_timeout": CONNECT_TIMEOUT_SECONDS}
@@ -117,8 +159,8 @@ def open_verified_connection(psycopg, target: TestDatabaseTarget):
         options["sslmode"] = "verify-full"
     try:
         connection = psycopg.connect(target.url, **options)
-    except Exception:
-        raise DatabaseTestSafetyError("Could not connect to the configured PostgreSQL test database; details omitted.") from None
+    except Exception as exc:
+        raise DatabaseTestSafetyError(_connection_error_message(exc)) from None
 
     try:
         verify_postgres_connection_identity(
