@@ -1,0 +1,98 @@
+name: Local PostgreSQL integration tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: local-postgres-integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  postgres-integration:
+    name: PostgreSQL 17 integration tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      PODCAST_TEST_DATABASE_URL: postgresql://podcast_test_runner:ci-only-password@localhost:5432/podcast_pipeline_test
+      PODCAST_TEST_ALLOW_REMOTE: "0"
+      PODCAST_TEST_EXPECTED_HOST: localhost
+      PODCAST_TEST_EXPECTED_DATABASE: podcast_pipeline_test
+      PODCAST_TEST_EXPECTED_USER: podcast_test_runner
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: podcast_pipeline_test
+          POSTGRES_USER: podcast_test_runner
+          POSTGRES_PASSWORD: ci-only-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U podcast_test_runner -d podcast_pipeline_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+          --health-start-period 5s
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install project and PostgreSQL test dependencies
+        run: >-
+          python -m pip install
+          --disable-pip-version-check
+          --no-input
+          -r requirements.txt
+          -r requirements-postgres.txt
+
+      - name: Verify local test target and PostgreSQL driver
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import sys
+
+          sys.path.insert(0, "tests")
+          import psycopg
+          from postgres_test_safety import resolve_test_target
+
+          target = resolve_test_target()
+          if target is None or target.remote:
+              raise SystemExit("The local PostgreSQL test target was not accepted.")
+          expected = (
+              os.environ["PODCAST_TEST_EXPECTED_HOST"],
+              os.environ["PODCAST_TEST_EXPECTED_DATABASE"],
+              os.environ["PODCAST_TEST_EXPECTED_USER"],
+          )
+          actual = (target.hostname, target.database, target.username)
+          if actual != expected or os.environ.get("PODCAST_TEST_ALLOW_REMOTE") != "0":
+              raise SystemExit("The configured target is not the expected local test database.")
+          print("Local PostgreSQL test target and Psycopg driver are ready.")
+          PY
+
+      - name: Run PostgreSQL integration tests
+        run: |
+          set -euo pipefail
+          output="$(python -m pytest tests/test_postgres_integration.py -q 2>&1)" || {
+            printf '%s\n' "$output"
+            exit 1
+          }
+          printf '%s\n' "$output"
+          if printf '%s\n' "$output" | grep -Eq '(^|[,[:space:]])[0-9]+ skipped'; then
+            echo "PostgreSQL integration tests must execute; skips are not accepted in this workflow."
+            exit 1
+          fi
