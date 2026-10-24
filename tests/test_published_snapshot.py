@@ -122,6 +122,113 @@ def test_isolated_rss_partial_audit_is_persisted_and_publishable(tmp_path: Path)
     assert dashboard_data.get_run_summary(database, "rss-partial-run")["rss_retrieval_failures"] == 1
 
 
+def test_rss_partial_with_apple_lookup_failure_is_not_publishable(tmp_path: Path):
+    database = tmp_path / "lookup-partial.sqlite"
+    def collector(*_args, **_kwargs):
+        result = rss_partial_collection()
+        return CollectionResult(
+            result.records,
+            {**result.report, "api_lookup_errors": ["repeat_lookup_1: dns_failure"]},
+        )
+    result = run_daily_pipeline(database, collector=collector, audit_run_id="lookup-partial-run")
+    assert result.pipeline_status == "partial"
+    with pytest.raises(SnapshotValidationError, match="eligible RSS-only partial"):
+        validate_publishable_snapshot(database, allow_recoverable_rss_partial=True)
+
+
+def test_rss_partial_with_one_unavailable_repeat_remains_eligible(tmp_path: Path):
+    database = tmp_path / "rss-partial-repeat-shortfall.sqlite"
+    base = rss_partial_collection()
+    report = {
+        **base.report,
+        "sampling": {
+            "max_records": 50,
+            "repeat_target": 10,
+            "exploration_target": 1,
+            "repeat_ids_selected_for_lookup": 10,
+            "actual_repeat_count": 9,
+            "actual_new_count": 1,
+            "repeat_shortfall": 1,
+            "exploration_shortfall": 0,
+            "repeat_lookup_outcomes": {"found": 9, "deleted_or_unavailable": 1},
+            "repeat_lookup_outcome_total": 10,
+            "repeat_lookup_outcomes_reconcile": True,
+            "repeat_lookup_no_matches": False,
+            "record_cap_shortfall": 40,
+        },
+    }
+    run_daily_pipeline(
+        database,
+        collector=lambda *_args, **_kwargs: CollectionResult(base.records, report),
+        audit_run_id="rss-partial-with-shortfall",
+    )
+    validate_publishable_snapshot(database, allow_recoverable_rss_partial=True)
+
+
+def test_total_unavailable_lookup_run_is_partial_and_not_publishable(tmp_path: Path):
+    database = tmp_path / "no-repeat-matches.sqlite"
+    base = rss_partial_collection()
+    report = {
+        **base.report,
+        "sampling": {
+            "max_records": 50,
+            "repeat_target": 35,
+            "exploration_target": 15,
+            "repeat_ids_selected_for_lookup": 35,
+            "actual_repeat_count": 0,
+            "actual_new_count": 10,
+            "repeat_shortfall": 35,
+            "exploration_shortfall": 5,
+            "repeat_lookup_outcomes": {"deleted_or_unavailable": 35},
+            "repeat_lookup_outcome_total": 35,
+            "repeat_lookup_outcomes_reconcile": True,
+            "repeat_lookup_no_matches": True,
+            "record_cap_shortfall": 40,
+        },
+    }
+    result = run_daily_pipeline(
+        database,
+        collector=lambda *_args, **_kwargs: CollectionResult(base.records, report),
+        audit_run_id="no-repeat-matches",
+    )
+    assert result.pipeline_status == "partial"
+    assert any("no requested prior ID was returned" in item for item in result.stage_failures)
+    with pytest.raises(SnapshotValidationError, match="eligible RSS-only partial"):
+        validate_publishable_snapshot(database, allow_recoverable_rss_partial=True)
+
+
+def test_successful_snapshot_with_inconsistent_lookup_counts_is_rejected(tmp_path: Path):
+    database = tmp_path / "inconsistent-lookup-counts.sqlite"
+    run_daily_pipeline(database, collector=successful_collection, audit_run_id="inconsistent-counts")
+    with sqlite3.connect(database) as connection:
+        (metadata_json,) = connection.execute(
+            "SELECT metadata_json FROM audit_runs WHERE audit_run_id = ?",
+            ("inconsistent-counts",),
+        ).fetchone()
+        metadata = json.loads(metadata_json)
+        metadata["collection_report"]["sampling"] = {
+            "max_records": 50,
+            "repeat_target": 1,
+            "exploration_target": 1,
+            "repeat_ids_selected_for_lookup": 1,
+            "actual_repeat_count": 0,
+            "actual_new_count": 1,
+            "repeat_shortfall": 1,
+            "exploration_shortfall": 0,
+            "repeat_lookup_outcomes": {"found": 1},
+            "repeat_lookup_outcome_total": 1,
+            "repeat_lookup_outcomes_reconcile": True,
+            "repeat_lookup_no_matches": True,
+            "record_cap_shortfall": 49,
+        }
+        connection.execute(
+            "UPDATE audit_runs SET metadata_json = ? WHERE audit_run_id = ?",
+            (json.dumps(metadata), "inconsistent-counts"),
+        )
+    with pytest.raises(SnapshotValidationError, match="sampling counts are inconsistent"):
+        validate_publishable_snapshot(database)
+
+
 @pytest.mark.parametrize(
     ("record_count", "rss_successes", "rss_failures", "api_errors"),
     [

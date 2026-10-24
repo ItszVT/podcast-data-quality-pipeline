@@ -144,6 +144,28 @@ def test_website_check_limit_and_checker_error_are_recorded_safely(tmp_path):
         assert "token" not in saved
 
 
+def test_website_checks_interleave_collection_strata(tmp_path):
+    records = [record(f"show-{index}", website=f"https://show-{index}.example") for index in range(24)]
+    strata = ("alpha", "beta", "gamma")
+    provenance = {
+        row["feed_id"]: {"source": "Apple iTunes Search API", "query_stratum": strata[index % 3], "storefront": "US", "observed_at": "2026-01-01T00:00:00+00:00"}
+        for index, row in enumerate(records)
+    }
+    calls = []
+    def checker(url, _config, *, deadline_monotonic):
+        calls.append(url)
+        return UrlCheckResult(url, url, 200, 0, (), 1.0, LIKELY_WORKING, "HTTP 200")
+    run_daily_pipeline(
+        tmp_path / "stratified.sqlite",
+        collector=lambda *_args, **_kwargs: collection(
+            records, record_provenance_by_feed=provenance, search_terms=list(strata)
+        ),
+        audit_run_id="stratified-checks", check_websites=True, website_checker=checker,
+    )
+    assert len(calls) == 20
+    assert calls[:6] == [f"https://show-{index}.example" for index in range(6)]
+
+
 def test_empty_collection_is_a_successful_zero_record_snapshot(tmp_path):
     database = tmp_path / "empty.sqlite"
     result = run_daily_pipeline(
@@ -180,6 +202,16 @@ def test_collection_failure_is_recorded_and_pipeline_is_not_successful(tmp_path)
         assert "controlled collection failure" in run["error_summary"]
 
 
+def test_prior_audited_ids_are_read_without_modifying_history(tmp_path):
+    database = tmp_path / "repeat-history.sqlite"
+    run_daily_pipeline(
+        database,
+        collector=lambda *_args, **_kwargs: collection([record("itunes:collection:prior")]),
+        audit_run_id="prior-run",
+    )
+    assert daily_pipeline_module._previously_audited_feed_ids(database) == {"itunes:collection:prior"}
+
+
 def test_partial_collection_keeps_returned_records_and_marks_snapshot_partial(tmp_path):
     database = tmp_path / "partial.sqlite"
     result = run_daily_pipeline(
@@ -198,6 +230,18 @@ def test_partial_collection_keeps_returned_records_and_marks_snapshot_partial(tm
         run = db.execute("SELECT run_status, metadata_json FROM audit_runs").fetchone()
         assert run["run_status"] == "partial"
         assert json.loads(run["metadata_json"])["collection_report"]["api_search_errors"]
+
+
+def test_rss_collection_deadline_marks_saved_audit_partial(tmp_path):
+    report = {"rss_collection_timed_out": True, "rss_timeout_unattempted_feeds": 3}
+    result = run_daily_pipeline(
+        tmp_path / "rss-timeout.sqlite",
+        collector=lambda *_args, **_kwargs: collection([record()], **report),
+        audit_run_id="rss-timeout-run",
+    )
+    assert result.pipeline_status == "partial"
+    assert result.collection_status == "partial"
+    assert any("deadline reached" in failure for failure in result.stage_failures)
 
 
 def test_validation_failure_stores_unmodified_collected_rows_and_fails_run(tmp_path):
@@ -388,6 +432,10 @@ def test_keyboard_interrupt_during_persistence_rolls_back_new_snapshot(tmp_path,
     [
         ({}, None, 0, "succeeded"),
         ({"api_search_errors": ["one term failed"]}, None, 2, "partial"),
+        ({"api_lookup_errors": ["repeat_lookup_1: dns_failure"]}, None, 2, "partial"),
+        ({"api_lookup_errors": ["repeat_lookup_1: dns_failure", "repeat_lookup_2: dns_failure"]}, None, 2, "partial"),
+        ({"api_lookup_errors": [f"repeat_lookup_{index}: dns_failure" for index in range(1, 36)]}, None, 2, "partial"),
+        ({"sampling": {"repeat_lookup_no_matches": True}}, None, 2, "partial"),
         ({}, RuntimeError("total collection failure"), 1, "failed"),
     ],
 )
@@ -408,6 +456,8 @@ def test_cli_exit_code_and_json_summary_match_run_status(
     summary = json.loads(capsys.readouterr().out)
     assert summary["pipeline_status"] == expected_status
     assert summary["persistence_status"] == "succeeded"
+    if report_overrides.get("api_lookup_errors"):
+        assert any("Apple ID lookup" in item for item in summary["stage_failures"])
 
 
 def test_preflight_failure_reports_run_id_without_starting_collection(tmp_path, monkeypatch, capsys):

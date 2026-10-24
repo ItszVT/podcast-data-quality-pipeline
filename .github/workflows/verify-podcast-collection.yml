@@ -1,0 +1,261 @@
+name: Verify podcast collection without publishing
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-podcast-collection
+  cancel-in-progress: false
+
+jobs:
+  verify-collection:
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      SNAPSHOT_BRANCH: audit-snapshots
+      SNAPSHOT_FILE: data/real_podcast_audits.sqlite
+      TEMP_DATABASE: ${{ runner.temp }}/podcast-collection-verification.sqlite
+      PIPELINE_OUTPUT: ${{ runner.temp }}/podcast-collection-verification.json
+
+    steps:
+      - name: Check out pipeline source
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pipeline dependencies
+        run: >-
+          python -m pip install
+          --disable-pip-version-check
+          --no-input
+          -r requirements.txt
+
+      - name: Restore published snapshot into runner temporary storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "refs/heads/${SNAPSHOT_BRANCH}:refs/remotes/origin/${SNAPSHOT_BRANCH}"
+          mapfile -t tracked_files < <(git ls-tree -r --name-only "origin/${SNAPSHOT_BRANCH}")
+          if [[ "${#tracked_files[@]}" -ne 1 || "${tracked_files[0]}" != "$SNAPSHOT_FILE" ]]; then
+            echo "The published snapshot branch has an unexpected file set; verification stopped."
+            exit 1
+          fi
+          if ! git show "origin/${SNAPSHOT_BRANCH}:${SNAPSHOT_FILE}" > "$TEMP_DATABASE"; then
+            echo "The published SQLite snapshot could not be restored; verification stopped."
+            exit 1
+          fi
+          python -c "import sys; from src.published_snapshot import validate_publishable_snapshot; validate_publishable_snapshot(sys.argv[1], allow_recoverable_rss_partial=True)" "$TEMP_DATABASE"
+          echo "Published snapshot restored and validated in temporary runner storage."
+
+      - name: Run the real repeat-and-explore collection plan
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e
+          python -m src.daily_pipeline --database "$TEMP_DATABASE" \
+            --run-id "verify-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" > "$PIPELINE_OUTPUT" \
+            2> "$RUNNER_TEMP/podcast-collection-verification-stderr.txt"
+          pipeline_exit=$?
+          set -e
+          python - "$PIPELINE_OUTPUT" "$TEMP_DATABASE" "$pipeline_exit" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json
+          import sqlite3
+          import sys
+          from datetime import datetime
+          from pathlib import Path
+
+          output_path, database_path, exit_text = sys.argv[1:]
+          try:
+              result = json.loads(Path(output_path).read_text(encoding="utf-8"))
+              if not isinstance(result, dict):
+                  raise ValueError
+          except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+              print("Verification failed; sanitized_category=cli_or_runtime.")
+              raise SystemExit(1)
+
+          allowed = {"succeeded", "partial", "failed", "skipped", "not_started"}
+          status_keys = ("pipeline_status", "collection_status", "validation_status", "persistence_status")
+          statuses = {key: result.get(key) for key in status_keys if result.get(key) in allowed}
+          report = result.get("collection_report")
+          report = report if isinstance(report, dict) else {}
+          sampling = report.get("sampling")
+          sampling = sampling if isinstance(sampling, dict) else {}
+          lookup = sampling.get("repeat_lookup_outcomes")
+          lookup = lookup if isinstance(lookup, dict) else {}
+          rss = report.get("rss_outcome_counts")
+          rss = rss if isinstance(rss, dict) else {}
+          lookup_errors = report.get("api_lookup_errors")
+          lookup_errors = lookup_errors if isinstance(lookup_errors, list) else []
+          search_errors = report.get("api_search_errors")
+          search_errors = search_errors if isinstance(search_errors, list) else []
+          provenance = report.get("record_provenance_by_feed")
+          provenance = provenance if isinstance(provenance, dict) else {}
+          source_counts = {"Apple iTunes Lookup API": 0, "Apple iTunes Search API": 0}
+          for item in provenance.values():
+              if isinstance(item, dict) and item.get("source") in source_counts:
+                  source_counts[item["source"]] += 1
+          run_id = result.get("audit_run_id")
+          unique_ids = 0
+          record_rows = 0
+          integrity_ok = False
+          if isinstance(run_id, str):
+              with sqlite3.connect(database_path) as connection:
+                  integrity_ok = connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+                  record_rows = connection.execute(
+                      "SELECT COUNT(*) FROM podcast_records WHERE audit_run_id = ?",
+                      (run_id,),
+                  ).fetchone()[0]
+                  found = connection.execute(
+                      "SELECT COUNT(DISTINCT feed_id) FROM podcast_records WHERE audit_run_id = ?",
+                      (run_id,),
+                  ).fetchone()
+                  unique_ids = int(found[0]) if found else 0
+
+          def safe_count(value):
+              return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+          safe_categories = {
+              "dns_failure", "tls_certificate_verification", "tls_connection", "timeout",
+              "destination_blocked", "response_size_limit", "redirect_failure",
+              "http_status_failure", "invalid_api_response", "malformed_feed",
+              "connection_failure", "request_failure",
+          }
+          def category_counts(errors):
+              counts = {}
+              for error in errors:
+                  category = error.rsplit(":", 1)[-1].strip() if isinstance(error, str) else ""
+                  if category not in safe_categories:
+                      category = "other_or_unknown_failure"
+                  counts[category] = counts.get(category, 0) + 1
+              return ", ".join(f"{name}={counts[name]}" for name in sorted(counts)) or "none"
+
+          elapsed = report.get("rss_collection_elapsed_seconds", 0)
+          if not isinstance(elapsed, (int, float)) or isinstance(elapsed, bool) or elapsed < 0:
+              elapsed = 0
+          runtime_seconds = 0
+          try:
+              started = datetime.fromisoformat(result["started_at"])
+              completed = datetime.fromisoformat(result["completed_at"])
+              runtime_seconds = max(0, int((completed - started).total_seconds()))
+          except (KeyError, TypeError, ValueError):
+              pass
+          print("## Controlled podcast collection verification")
+          print("- Pipeline: " + statuses.get("pipeline_status", "unknown"))
+          print("- Collection: " + statuses.get("collection_status", "unknown"))
+          print("- Validation: " + statuses.get("validation_status", "unknown"))
+          print("- Persistence to temporary database: " + statuses.get("persistence_status", "unknown"))
+          print(f"- Repeat target / achieved: {safe_count(sampling.get('repeat_target'))} / {safe_count(sampling.get('actual_repeat_count'))}")
+          print(f"- Exploration target / achieved: {safe_count(sampling.get('exploration_target'))} / {safe_count(sampling.get('actual_new_count'))}")
+          print(f"- Repeat shortfall: {safe_count(sampling.get('repeat_shortfall'))}")
+          print(f"- Exploration shortfall: {safe_count(sampling.get('exploration_shortfall'))}")
+          print(f"- Record-cap shortfall: {safe_count(sampling.get('record_cap_shortfall'))}")
+          print(f"- Repeat lookup outcomes: found={safe_count(lookup.get('found'))}; unavailable/deleted={safe_count(lookup.get('deleted_or_unavailable'))}; mismatched={safe_count(lookup.get('mismatched_result'))}; request failures={safe_count(lookup.get('request_failure'))}; missing required metadata={safe_count(lookup.get('missing_required_metadata'))}; unsupported saved IDs={safe_count(sampling.get('previously_audited_ids_unsupported'))}")
+          print(f"- Repeat lookup request error categories: {category_counts(lookup_errors)}")
+          print(f"- Exploration search error categories: {category_counts(search_errors)}")
+          print(f"- Unique IDs persisted for this verification run: {unique_ids}")
+          print(f"- Podcast rows persisted for this verification run: {safe_count(record_rows)}")
+          print(f"- Source coverage: {source_counts['Apple iTunes Lookup API']} ID lookups; {source_counts['Apple iTunes Search API']} search results")
+          print(f"- Total pipeline runtime: {runtime_seconds} seconds")
+          print(f"- RSS: {safe_count(report.get('rss_retrieval_successes'))} parsed; {safe_count(report.get('rss_retrieval_failures'))} failed or unattempted; {safe_count(report.get('missing_rss_feed_urls'))} missing feed URLs")
+          print("- RSS attempt categories: " + ", ".join(
+              f"{name}={safe_count(rss.get(name))}" for name in (
+                  "dns_failure", "connection_tls_failure", "http_error", "timeout",
+                  "response_size_limit", "xml_parsing_failure", "successful_parsing",
+                  "other_or_unknown_failure",
+              )
+          ))
+          print(f"- RSS stage: {elapsed:.1f} seconds; deadline reached: {bool(report.get('rss_collection_timed_out'))}")
+          print(f"- Temporary SQLite integrity: {'ok' if integrity_ok else 'failed'}")
+
+          lookup_selected = safe_count(sampling.get("repeat_ids_selected_for_lookup"))
+          lookup_found = safe_count(lookup.get("found"))
+          lookup_outcome_total = sum(safe_count(value) for value in lookup.values())
+          lookup_counts_reconcile = (
+              lookup_outcome_total == lookup_selected
+              and safe_count(sampling.get("repeat_lookup_outcome_total")) == lookup_selected
+              and sampling.get("repeat_lookup_outcomes_reconcile") is True
+              and lookup_found == safe_count(sampling.get("actual_repeat_count"))
+              and safe_count(lookup.get("request_failure")) == len(lookup_errors)
+              and safe_count(sampling.get("actual_repeat_count"))
+                  + safe_count(sampling.get("actual_new_count")) == unique_ids
+              and safe_count(sampling.get("repeat_shortfall")) == max(
+                  0, safe_count(sampling.get("repeat_target"))
+                  - safe_count(sampling.get("actual_repeat_count"))
+              )
+              and safe_count(sampling.get("exploration_shortfall")) == max(
+                  0, safe_count(sampling.get("exploration_target"))
+                  - safe_count(sampling.get("actual_new_count"))
+              )
+              and safe_count(sampling.get("max_records")) >= unique_ids
+              and safe_count(sampling.get("record_cap_shortfall")) == max(
+                  0, safe_count(sampling.get("max_records")) - unique_ids
+              )
+          )
+          rss_attempt_categories = (
+              "dns_failure", "connection_tls_failure", "http_error", "timeout",
+              "response_size_limit", "xml_parsing_failure", "successful_parsing",
+              "other_or_unknown_failure",
+          )
+          rss_counts_reconcile = (
+              sum(safe_count(rss.get(name)) for name in rss_attempt_categories)
+                  == safe_count(report.get("rss_attempted_count"))
+              and safe_count(rss.get("successful_parsing"))
+                  == safe_count(report.get("rss_retrieval_successes"))
+              and sum(safe_count(rss.get(name)) for name in rss_attempt_categories if name != "successful_parsing")
+                  + safe_count(report.get("rss_timeout_unattempted_feeds"))
+                  == safe_count(report.get("rss_retrieval_failures"))
+              and safe_count(rss.get("missing_feed_url"))
+                  == safe_count(report.get("missing_rss_feed_urls"))
+              and safe_count(report.get("rss_attempted_count"))
+                  + safe_count(report.get("missing_rss_feed_urls"))
+                  + safe_count(report.get("rss_timeout_unattempted_feeds")) == unique_ids
+              and report.get("rss_attempt_counts_reconcile") is True
+              and report.get("rss_record_counts_reconcile") is True
+              and safe_count(report.get("rss_attempt_outcome_total"))
+                  == safe_count(report.get("rss_attempted_count"))
+              and safe_count(report.get("rss_record_outcome_total")) == unique_ids
+          )
+
+          try:
+              code = int(exit_text)
+          except ValueError:
+              code = 1
+          valid_run = (
+              code in {0, 2}
+              and statuses.get("pipeline_status") in {"succeeded", "partial"}
+              and statuses.get("collection_status") in {"succeeded", "partial"}
+              and statuses.get("validation_status") == "succeeded"
+              and statuses.get("persistence_status") == "succeeded"
+              and unique_ids > 0
+              and unique_ids == record_rows
+              and unique_ids == safe_count(report.get("unique_records_retained"))
+              and integrity_ok
+              and safe_count(sampling.get("repeat_target")) == 35
+              and safe_count(sampling.get("exploration_target")) == 15
+              and safe_count(sampling.get("repeat_ids_selected_for_lookup")) == 35
+              and safe_count(sampling.get("actual_repeat_count")) > 0
+              and safe_count(sampling.get("actual_new_count")) > 0
+              and safe_count(report.get("api_search_calls")) == 15
+              and safe_count(report.get("api_lookup_calls")) == safe_count(sampling.get("repeat_ids_selected_for_lookup"))
+              and not lookup_errors
+              and not search_errors
+              and lookup_counts_reconcile
+              and safe_count(report.get("rss_attempted_count")) > 0
+              and safe_count(rss.get("successful_parsing")) > 0
+              and rss_counts_reconcile
+          )
+          if not valid_run:
+              print("Verification did not complete all required checks; no snapshot was published.")
+              raise SystemExit(1)
+          print("Verification completed. The temporary database will be discarded with the runner.")
+          PY

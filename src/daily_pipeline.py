@@ -16,7 +16,7 @@ from .audit_runner import AuditRunnerError, validate_existing_database
 from .database import persist_audit_run
 from .database_config import require_sqlite_backend
 from .geo_intelligence import build_geo_intelligence, classify_episode_languages
-from .podcast_collector import SEARCH_TERMS, CollectionResult, CollectorConfig, collect_podcasts
+from .podcast_collector import CollectionResult, CollectorConfig, collect_podcasts
 from .validation import ValidationReport, validate_records
 from .url_checker import INCONCLUSIVE, UrlCheckResult, UrlCheckerConfig, check_website_url
 
@@ -83,9 +83,25 @@ def _raw_records(records: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _collection_status(result: CollectionResult) -> str:
     report = result.report
-    if report.get("api_search_errors") or report.get("rss_retrieval_failures", 0):
+    sampling = report.get("sampling")
+    no_repeat_matches = (
+        isinstance(sampling, dict)
+        and sampling.get("repeat_lookup_no_matches") is True
+    )
+    if report.get("api_search_errors") or report.get("api_lookup_errors") or no_repeat_matches or report.get("rss_retrieval_failures", 0) or report.get("rss_collection_timed_out"):
         return "partial"
     return "succeeded"
+
+
+def _previously_audited_feed_ids(database_file: Path) -> set[str]:
+    """Read stable source identifiers from prior runs without changing history."""
+    if not database_file.is_file():
+        return set()
+    uri = database_file.resolve().as_uri() + "?mode=ro"
+    with sqlite3.connect(uri, uri=True, timeout=5) as connection:
+        return {str(row[0]) for row in connection.execute(
+            "SELECT DISTINCT feed_id FROM podcast_records WHERE feed_id IS NOT NULL"
+        )}
 
 
 def run_daily_pipeline(
@@ -130,7 +146,7 @@ def run_daily_pipeline(
     validate_fn = validator or validate_records
     persist_fn = persister or persist_audit_run
     settings = config or CollectorConfig()
-    terms = tuple(search_terms) if search_terms is not None else SEARCH_TERMS
+    terms = tuple(search_terms) if search_terms is not None else None
 
     collection_status = "failed"
     validation_status = "skipped"
@@ -150,19 +166,34 @@ def run_daily_pipeline(
     website_unexpected_errors = 0
 
     try:
-        result = collect_fn(settings, search_terms=terms)
+        if collector is None:
+            result = collect_fn(
+                settings, search_terms=terms,
+                previously_audited_feed_ids=_previously_audited_feed_ids(database_file),
+            )
+        else:
+            result = collect_fn(settings, search_terms=terms)
         collected = result.records
         collection_report = result.report
         collection_status = _collection_status(result)
         if collection_status == "partial":
             api_errors = result.report.get("api_search_errors") or []
+            lookup_errors = result.report.get("api_lookup_errors") or []
             rss_errors = result.report.get("rss_errors") or []
+            sampling = result.report.get("sampling")
+            no_repeat_matches = isinstance(sampling, dict) and sampling.get("repeat_lookup_no_matches") is True
+            if lookup_errors:
+                failures.append("collection partial (Apple ID lookup): " + "; ".join(str(item) for item in lookup_errors))
+            elif no_repeat_matches:
+                failures.append("collection partial (Apple ID lookup): no requested prior ID was returned")
             if api_errors:
                 failures.append("collection partial (API search): " + "; ".join(str(item) for item in api_errors))
             if rss_errors:
                 failures.append("collection partial (RSS metadata): " + "; ".join(str(item) for item in rss_errors))
             elif result.report.get("rss_retrieval_failures", 0):
                 failures.append("collection partial (RSS metadata): {} feed(s) failed".format(result.report["rss_retrieval_failures"]))
+            if result.report.get("rss_collection_timed_out"):
+                failures.append("collection partial (RSS metadata): collection deadline reached")
     except Exception as exc:
         failures.append(f"collection: {type(exc).__name__}: {exc}")
 
@@ -189,14 +220,41 @@ def run_daily_pipeline(
         checker = website_checker or check_website_url
         check_settings = website_checker_config or UrlCheckerConfig()
         deadline = time.monotonic() + min(check_settings.stage_budget_seconds, 90.0)
-        candidates: dict[str, list[int]] = {}
+        candidates: dict[str, dict[str, Any]] = {}
+        provenance = collection_report.get("record_provenance_by_feed", {})
+        provenance = provenance if isinstance(provenance, dict) else {}
+        term_order = collection_report.get("search_terms", ())
+        term_order = [str(term) for term in term_order] if isinstance(term_order, (list, tuple)) else []
+        stratum_details = collection_report.get("search_strata", ())
+        if isinstance(stratum_details, (list, tuple)):
+            configured_order = [str(item.get("label")) for item in stratum_details
+                                if isinstance(item, dict) and item.get("label")]
+            if configured_order:
+                term_order = configured_order
         for row in validation_report.records if validation_report else ():
             if any(issue.category in {"blank_website_url", "malformed_url", "unsupported_url_scheme"} for issue in row.issues):
                 continue
             candidate = row.normalized.get("normalized_website_url")
             if candidate:
-                candidates.setdefault(str(candidate), []).append(row.source_row)
-        for candidate, source_rows in candidates.items():
+                feed_id = str(row.normalized.get("feed_id") or "")
+                record_source = provenance.get(feed_id, {})
+                stratum = str(record_source.get("query_stratum") or "__legacy__") if isinstance(record_source, dict) else "__legacy__"
+                entry = candidates.setdefault(str(candidate), {"source_rows": [], "stratum": stratum})
+                entry["source_rows"].append(row.source_row)
+                if entry["stratum"] == "__legacy__" and stratum != "__legacy__":
+                    entry["stratum"] = stratum
+        strata: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+        for candidate, entry in candidates.items():
+            strata.setdefault(entry["stratum"], []).append((candidate, entry))
+        ordered_strata = [term for term in term_order if term in strata]
+        ordered_strata.extend(sorted(term for term in strata if term not in ordered_strata))
+        interleaved: list[tuple[str, dict[str, Any]]] = []
+        while any(strata[term] for term in ordered_strata):
+            for term in ordered_strata:
+                if strata[term]:
+                    interleaved.append(strata[term].pop(0))
+        for candidate, entry in interleaved:
+            source_rows = entry["source_rows"]
             if website_unique_count >= 20:
                 website_status, website_stop_reason = "partial", "unique_url_limit_reached"
                 break
@@ -350,8 +408,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--read-timeout-seconds", type=_positive_float, default=7.0)
     parser.add_argument("--max-response-bytes", type=_positive_int, default=2_000_000)
     parser.add_argument("--max-redirects", type=_nonnegative_int, default=3)
-    parser.add_argument("--api-pacing-seconds", type=_nonnegative_float, default=3.0)
+    parser.add_argument("--api-pacing-seconds", type=_nonnegative_float, default=3.2)
     parser.add_argument("--rss-pacing-seconds", type=_nonnegative_float, default=0.4)
+    parser.add_argument("--repeat-target", type=_nonnegative_int, help="Target previously audited podcasts (default up to 35).")
+    parser.add_argument("--exploration-target", type=_nonnegative_int, help="Target new exploration podcasts (default up to 15).")
+    parser.add_argument("--rss-collection-budget-seconds", type=_positive_float, default=240.0)
+    parser.add_argument("--rss-request-timeout-seconds", type=_positive_float, default=12.0)
     parser.add_argument("--check-websites", action="store_true", help="Check up to 20 unique validated website URLs (bounded network requests).")
     args = parser.parse_args(argv)
     if args.search_terms and any(not term.strip() for term in args.search_terms):
@@ -363,6 +425,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         read_timeout_seconds=args.read_timeout_seconds,
         max_response_bytes=args.max_response_bytes, max_redirects=args.max_redirects,
         api_pacing_seconds=args.api_pacing_seconds, rss_pacing_seconds=args.rss_pacing_seconds,
+        repeat_target=args.repeat_target, exploration_target=args.exploration_target,
+        rss_collection_budget_seconds=args.rss_collection_budget_seconds,
+        rss_request_timeout_seconds=args.rss_request_timeout_seconds,
     )
     try:
         summary = run_daily_pipeline(
