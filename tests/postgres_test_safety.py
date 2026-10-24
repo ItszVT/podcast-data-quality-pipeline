@@ -141,8 +141,18 @@ def _connection_error_message(exc: BaseException) -> str:
         return "PostgreSQL authentication failed."
     if any(token in text for token in ("hostname mismatch", "host name mismatch", "does not match the host name", "does not match host name", "no alternative certificate subject name")):
         return "PostgreSQL TLS hostname verification failed."
-    if any(token in text for token in ("root certificate", "root.crt", "certificate verify failed", "unable to get local issuer", "unknown ca", "self-signed certificate")):
+    if any(token in text for token in (
+        "root certificate file", "root.crt", "unable to get local issuer certificate",
+        "unable to verify the first certificate", "unknown ca", "self-signed certificate",
+    )):
         return "PostgreSQL TLS certificate trust verification failed."
+    if any(token in text for token in (
+        "certificate has expired", "certificate is not yet valid", "certificate revoked",
+        "certificate has been revoked",
+    )):
+        return "PostgreSQL TLS certificate validity check failed."
+    if "certificate verify failed" in text:
+        return "PostgreSQL TLS certificate verification failed."
     if any(token in text for token in ("ssl", "tls", "certificate", "cert verification", "sslerror")):
         return "PostgreSQL TLS verification failed."
     if any(token in text for token in ("getaddrinfo", "name or service not known", "name resolution", "nodename nor servname", "dns", "could not translate host")):

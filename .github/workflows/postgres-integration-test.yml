@@ -198,6 +198,39 @@ jobs:
           -r requirements.txt
           -r requirements-postgres.txt
 
+      - name: Diagnose PostgreSQL client and CA trust availability
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import pathlib
+          import psycopg
+          import ssl
+
+          paths = ssl.get_default_verify_paths()
+          system_bundle = pathlib.Path("/etc/ssl/certs/ca-certificates.crt")
+          try:
+              ssl.create_default_context(cafile=str(system_bundle))
+              system_bundle_loadable = True
+          except (OSError, ssl.SSLError):
+              system_bundle_loadable = False
+
+          print(f"psycopg_version={psycopg.__version__}")
+          print(f"psycopg_pq_implementation={psycopg.pq.__impl__}")
+          print(f"libpq_version={psycopg.pq.version()}")
+          print(f"libpq_build_version={getattr(psycopg.pq, '__build_version__', 'unavailable')}")
+          print(f"system_ca_bundle_available={system_bundle.is_file() and system_bundle.stat().st_size > 0}")
+          print(f"system_ca_bundle_loadable_by_python_ssl={system_bundle_loadable}")
+          print(f"python_ssl_default_cafile_available={bool(paths.cafile and os.path.isfile(paths.cafile))}")
+          print(f"python_ssl_default_capath_available={bool(paths.capath and os.path.isdir(paths.capath))}")
+          print(f"ssl_cert_file_override_configured={bool(os.environ.get('SSL_CERT_FILE'))}")
+          print(f"ssl_cert_dir_override_configured={bool(os.environ.get('SSL_CERT_DIR'))}")
+          print("postgres_test_sslmode=verify-full")
+          print("postgres_test_sslrootcert=system")
+          print("tls_error_classification=emitted as a fixed safe category by the test fixture on connection failure")
+          PY
+
       - name: Run isolated PostgreSQL integration tests
         shell: bash
         env:

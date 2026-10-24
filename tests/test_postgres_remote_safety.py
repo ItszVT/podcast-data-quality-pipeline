@@ -173,7 +173,7 @@ def test_configuration_errors_never_echo_credentials_or_full_url():
         (type("OperationalError", (Exception,), {})
          ("password authentication failed for user secret at private.example"), "PostgreSQL authentication failed."),
         (type("OperationalError", (Exception,), {})
-         ("certificate verify failed for private.example"), "PostgreSQL TLS certificate trust verification failed."),
+         ("certificate verify failed for private.example"), "PostgreSQL TLS certificate verification failed."),
         (type("OperationalError", (Exception,), {})
          ("could not translate host name private.example"), "PostgreSQL host name could not be resolved."),
         (type("OperationalError", (Exception,), {})
@@ -207,6 +207,8 @@ def test_connection_failures_use_safe_classifications_without_connection_details
     [
         ("certificate verify failed: unable to get local issuer certificate at hidden.example", "PostgreSQL TLS certificate trust verification failed."),
         ("hostname mismatch for hidden.example", "PostgreSQL TLS hostname verification failed."),
+        ("certificate has expired at hidden.example", "PostgreSQL TLS certificate validity check failed."),
+        ("certificate verify failed for hidden.example", "PostgreSQL TLS certificate verification failed."),
     ],
 )
 def test_tls_diagnostics_distinguish_trust_from_hostname_without_sensitive_details(detail, expected):
