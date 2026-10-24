@@ -12,11 +12,13 @@ The collector writes `data/real_podcasts.csv` and `reports/real_podcasts_collect
 
 - Public HTTP(S) destinations only; credentials, localhost/reserved names, non-global IPv4/IPv6 addresses, DNS results containing any non-global address, and malformed URLs are rejected.
 - Every redirect target is independently validated before it is requested. Redirects are manual and limited to three.
-- Explicit connection/read timeouts and a 2 MB response cap apply to API and RSS responses. Requests are sequential; the collector spaces API searches by three seconds and RSS fetches by 0.4 seconds.
+- Explicit connection/read timeouts and a 4,000,000-byte response cap apply to API and RSS responses. Bodies are streamed and rejected as soon as the cap is exceeded; incomplete responses are not parsed as valid feeds. Requests are sequential; the collector spaces API searches by three seconds and RSS fetches by 0.4 seconds.
 - Environment proxy settings are disabled so a configured proxy cannot alter the destination.
 - DNS resolution is checked immediately before requesting, but `requests` resolves the hostname again while connecting. DNS rebinding between those operations remains possible; this implementation does not claim to eliminate that race.
 - RSS/XML/API failures are recorded and do not discard the Apple listing record. XML parsing is local; no embedded link is fetched.
 - No external network calls occur in the test suite. Its API behavior is mocked and its RSS behavior uses a controlled local HTTP server.
+
+The 4,000,000-byte cap was selected after a controlled paired experiment using the same 50 podcast IDs and resolved RSS URLs under both 2,000,000-byte and 4,000,000-byte limits. The higher cap produced 42 complete RSS parses versus 36, recovered six feeds from size-limit failures, and caused no successful-parse regressions. Peak sampled process RSS was 70.7 MiB versus 68.03 MiB. These results support the bounded increase for this sample; they do not establish that a larger cap is needed or appropriate.
 
 ## Run and audit
 

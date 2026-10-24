@@ -152,7 +152,7 @@ class CollectorConfig:
     results_per_term: int = 10
     connect_timeout_seconds: float = 4.0
     read_timeout_seconds: float = 7.0
-    max_response_bytes: int = 2_000_000
+    max_response_bytes: int = 4_000_000
     max_redirects: int = 3
     api_pacing_seconds: float = 3.2
     rss_pacing_seconds: float = 0.4

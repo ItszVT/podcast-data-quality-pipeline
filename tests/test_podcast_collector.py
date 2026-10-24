@@ -105,7 +105,7 @@ def test_fetch_rss_metadata_from_controlled_local_fixture(local_server):
     assert server.requests_seen == 1
 
 
-def collect_single_rss_report(base, *, max_response_bytes=2_000_000):
+def collect_single_rss_report(base, *, max_response_bytes=4_000_000):
     config = CollectorConfig(
         max_records=1, repeat_target=0, exploration_target=1,
         max_response_bytes=max_response_bytes, api_pacing_seconds=0,
@@ -128,7 +128,7 @@ def test_rss_size_telemetry_records_valid_declared_length_as_unverified_band(loc
     report = collect_single_rss_report(base)
     diagnostics = report["rss_response_size_diagnostics"]
 
-    assert CollectorConfig().max_response_bytes == 2_000_000
+    assert CollectorConfig().max_response_bytes == 4_000_000
     assert diagnostics["declared_content_length_status_counts"]["valid"] == 1
     assert diagnostics["declared_content_length_size_bands"]["under_256_kib"] == 1
     assert diagnostics["size_limit_failure_count"] == 0
@@ -230,6 +230,14 @@ def test_oversized_rss_response_is_rejected(local_server):
     Handler.body = b"x" * 100
     with pytest.raises(CollectionError, match="size limit"):
         fetch_rss_metadata(base + "/feed", CollectorConfig(max_response_bytes=20))
+    assert server.requests_seen == 1
+
+
+def test_production_default_rejects_rss_response_over_four_million_bytes(local_server):
+    server, base = local_server
+    Handler.body = b"x" * 4_000_001
+    with pytest.raises(CollectionError, match="size limit"):
+        fetch_rss_metadata(base + "/feed", CollectorConfig())
     assert server.requests_seen == 1
 
 

@@ -20,10 +20,12 @@ Website checks are not part of this command. The collector retains its existing 
 - --results-per-term N sets Apple's requested results per search term (default 10).
 - --search-term TERM sets a search term; repeat it to provide several. If omitted, the collector's standard search terms are used.
 - --connect-timeout-seconds N and --read-timeout-seconds N configure the existing collector timeouts.
-- --max-response-bytes N sets its response-size ceiling.
+- --max-response-bytes N sets its response-size ceiling (default 4,000,000 bytes for each Apple API and RSS response).
 - --max-redirects N sets its redirect limit.
 - --api-pacing-seconds N and --rss-pacing-seconds N configure request spacing.
 - --run-id ID supplies an idempotency key. If that ID is already saved in the selected database, the runner refuses before making collection requests.
+
+The 4,000,000-byte default was adopted after a controlled paired RSS experiment on the same 50 podcast IDs and in-memory resolved feed URLs. The 4 MB condition parsed 42 feeds versus 36 at 2 MB, recovering six feeds previously rejected by the size cap, with no successful-parse regressions. Peak sampled process RSS was 70.7 MiB at 4 MB versus 68.03 MiB at 2 MB. The cap remains enforced while streaming; only fully received XML is parsed. DNS/IP validation, DNS-pinned connections, strict TLS and hostname verification, redirect revalidation, request timeouts, and the RSS-stage deadline are unchanged.
 
 For example:
 

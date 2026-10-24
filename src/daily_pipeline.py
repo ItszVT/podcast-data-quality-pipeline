@@ -406,7 +406,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="Search term; repeat to set multiple terms (defaults to the collector's terms).")
     parser.add_argument("--connect-timeout-seconds", type=_positive_float, default=4.0)
     parser.add_argument("--read-timeout-seconds", type=_positive_float, default=7.0)
-    parser.add_argument("--max-response-bytes", type=_positive_int, default=2_000_000)
+    parser.add_argument("--max-response-bytes", type=_positive_int, default=4_000_000)
     parser.add_argument("--max-redirects", type=_nonnegative_int, default=3)
     parser.add_argument("--api-pacing-seconds", type=_nonnegative_float, default=3.2)
     parser.add_argument("--rss-pacing-seconds", type=_nonnegative_float, default=0.4)

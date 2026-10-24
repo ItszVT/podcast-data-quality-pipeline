@@ -471,6 +471,22 @@ def test_cli_exit_code_and_json_summary_match_run_status(
         assert any("Apple ID lookup" in item for item in summary["stage_failures"])
 
 
+def test_daily_cli_defaults_response_size_limit_to_four_million_bytes(tmp_path, monkeypatch, capsys):
+    observed_configs = []
+
+    def collect(config, **_kwargs):
+        observed_configs.append(config)
+        return collection([record()])
+
+    monkeypatch.setattr(daily_pipeline_module, "collect_podcasts", collect)
+    assert daily_pipeline_module.main([
+        "--database", str(tmp_path / "default-cap.sqlite"), "--run-id", "default-cap-run"
+    ]) == 0
+    capsys.readouterr()
+    assert len(observed_configs) == 1
+    assert observed_configs[0].max_response_bytes == 4_000_000
+
+
 def test_cli_json_schema_keeps_collection_report_in_run_scoped_sqlite_metadata(
     tmp_path, monkeypatch, capsys
 ):

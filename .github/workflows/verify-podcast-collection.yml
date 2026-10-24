@@ -212,7 +212,7 @@ jobs:
               and all(read_count(content_length_bands.get(key)) is not None for key in content_length_band_fields)
               and all(read_count(observed_lower_bound_bands.get(key)) is not None for key in observed_lower_bound_fields)
               and read_count(rss_size.get("attempt_count")) == safe_count(report.get("rss_attempted_count"))
-              and read_count(rss_size.get("limit_bytes")) == 2_000_000
+              and read_count(rss_size.get("limit_bytes")) == 4_000_000
               and read_count(rss_size.get("size_limit_failure_count")) == safe_count(rss.get("response_size_limit"))
               and sum(read_count(content_length_status.get(key)) or 0 for key in content_length_status_fields)
                   == safe_count(report.get("rss_attempted_count"))

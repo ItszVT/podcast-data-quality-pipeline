@@ -70,7 +70,8 @@ class FakeClock:
 
 
 def test_production_default_and_experiment_caps_are_fixed():
-    assert CollectorConfig().max_response_bytes == CAP_2_MB == 2_000_000
+    assert CollectorConfig().max_response_bytes == 4_000_000
+    assert CAP_2_MB == 2_000_000
     assert EXPERIMENT_CAPS == (2_000_000, 4_000_000)
     assert max(EXPERIMENT_CAPS) == CAP_4_MB
 
