@@ -110,6 +110,8 @@ def test_remote_database_and_user_mismatch_fail_before_any_schema_operation():
         connection = FakeConnection(actual)
 
         class FakePsycopg:
+            pq = types.SimpleNamespace(version=lambda: 160000)
+
             @staticmethod
             def connect(*_args, **_kwargs):
                 return connection
@@ -141,9 +143,12 @@ def test_unencrypted_remote_connection_fails_before_schema_creation():
     connection = FakeConnection()
 
     class FakePsycopg:
+        pq = types.SimpleNamespace(version=lambda: 160000)
+
         @staticmethod
         def connect(*_args, **kwargs):
             assert kwargs["sslmode"] == "verify-full"
+            assert kwargs["sslrootcert"] == "system"
             return connection
 
     with pytest.raises(DatabaseTestSafetyError, match="not encrypted"):
@@ -168,7 +173,7 @@ def test_configuration_errors_never_echo_credentials_or_full_url():
         (type("OperationalError", (Exception,), {})
          ("password authentication failed for user secret at private.example"), "PostgreSQL authentication failed."),
         (type("OperationalError", (Exception,), {})
-         ("certificate verify failed for private.example"), "PostgreSQL TLS verification failed."),
+         ("certificate verify failed for private.example"), "PostgreSQL TLS certificate trust verification failed."),
         (type("OperationalError", (Exception,), {})
          ("could not translate host name private.example"), "PostgreSQL host name could not be resolved."),
         (type("OperationalError", (Exception,), {})
@@ -181,6 +186,8 @@ def test_connection_failures_use_safe_classifications_without_connection_details
     target = resolve_test_target(remote_env())
 
     class FakePsycopg:
+        pq = types.SimpleNamespace(version=lambda: 160000)
+
         @staticmethod
         def connect(*_args, **_kwargs):
             raise error
@@ -193,6 +200,38 @@ def test_connection_failures_use_safe_classifications_without_connection_details
     assert "secret" not in message
     assert "private.example" not in message
     assert "postgresql://" not in message
+
+
+@pytest.mark.parametrize(
+    "detail, expected",
+    [
+        ("certificate verify failed: unable to get local issuer certificate at hidden.example", "PostgreSQL TLS certificate trust verification failed."),
+        ("hostname mismatch for hidden.example", "PostgreSQL TLS hostname verification failed."),
+    ],
+)
+def test_tls_diagnostics_distinguish_trust_from_hostname_without_sensitive_details(detail, expected):
+    from postgres_test_safety import _connection_error_message
+
+    message = _connection_error_message(RuntimeError(detail))
+
+    assert message == expected
+    assert "hidden.example" not in message
+
+
+def test_remote_connection_requires_libpq_16_for_system_ca_support():
+    target = resolve_test_target(remote_env())
+    called = []
+
+    class FakePsycopg:
+        pq = types.SimpleNamespace(version=lambda: 150000)
+
+        @staticmethod
+        def connect(*_args, **_kwargs):
+            called.append(True)
+
+    with pytest.raises(DatabaseTestSafetyError, match="libpq 16 or newer"):
+        open_verified_connection(FakePsycopg, target)
+    assert called == []
 
 
 def test_cleanup_refuses_to_drop_schema_other_than_fixture_owned_name():
@@ -312,6 +351,7 @@ def _install_fake_driver(monkeypatch, *connections):
     available_connections = list(connections)
     driver = types.ModuleType("psycopg")
     driver.sql = _FakeSQL
+    driver.pq = types.SimpleNamespace(version=lambda: 160000)
 
     def connect(url, **kwargs):
         calls.append((url, kwargs))

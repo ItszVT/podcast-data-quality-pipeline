@@ -139,6 +139,10 @@ def _connection_error_message(exc: BaseException) -> str:
     text = " ".join(hints)
     if any(token in text for token in ("password", "authentication", "invalid_authorization", "28p01", "28000")):
         return "PostgreSQL authentication failed."
+    if any(token in text for token in ("hostname mismatch", "host name mismatch", "does not match the host name", "does not match host name", "no alternative certificate subject name")):
+        return "PostgreSQL TLS hostname verification failed."
+    if any(token in text for token in ("root certificate", "root.crt", "certificate verify failed", "unable to get local issuer", "unknown ca", "self-signed certificate")):
+        return "PostgreSQL TLS certificate trust verification failed."
     if any(token in text for token in ("ssl", "tls", "certificate", "cert verification", "sslerror")):
         return "PostgreSQL TLS verification failed."
     if any(token in text for token in ("getaddrinfo", "name or service not known", "name resolution", "nodename nor servname", "dns", "could not translate host")):
@@ -156,7 +160,18 @@ def open_verified_connection(psycopg, target: TestDatabaseTarget):
     """Verify server identity and transport encryption before schema changes."""
     options = {"connect_timeout": CONNECT_TIMEOUT_SECONDS}
     if target.remote:
+        try:
+            libpq_version = psycopg.pq.version()
+        except Exception:
+            raise DatabaseTestSafetyError(
+                "Could not confirm PostgreSQL client support for system CA verification; no connection was attempted."
+            ) from None
+        if not isinstance(libpq_version, int) or libpq_version < 160000:
+            raise DatabaseTestSafetyError(
+                "Remote PostgreSQL tests require libpq 16 or newer for system CA verification; no connection was attempted."
+            )
         options["sslmode"] = "verify-full"
+        options["sslrootcert"] = "system"
     try:
         connection = psycopg.connect(target.url, **options)
     except Exception as exc:
