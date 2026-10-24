@@ -376,7 +376,7 @@ if summary["run_status"] == "partial":
     if isinstance(rss_failures, int) and rss_failures > 0:
         st.warning(
             f"RSS metadata could not be fetched for {rss_failures} podcast feed(s). "
-            "Records returned by successful searches were retained, validated, and saved; "
+            "Records returned by successful catalog requests were retained, validated, and saved; "
             "this audit remains marked partially completed."
         )
     else:

@@ -2,7 +2,7 @@
 
 ## Source and collection method
 
-The collector uses Apple's public [iTunes Search API](https://developer.apple.com/library/archive/documentation/AudioVideo/Conceptual/iTuneSearchAPI/) at `https://itunes.apple.com/search`, searching for podcasts in the US storefront with these terms: technology, science, business, education, news, comedy, health, history, true crime, and culture. It retains up to 50 unique podcasts using `collectionId` as the stable identifier (`itunes:collection:<id>`). The storefront parameter defines the catalog searched; it is not treated as the publisher's country.
+The collector uses Apple's public [iTunes Search and Lookup APIs](https://developer.apple.com/library/archive/documentation/AudioVideo/Conceptual/iTuneSearchAPI/) and retains up to 50 unique podcasts using `collectionId` as the stable identifier (`itunes:collection:<id>`). The daily pipeline targets 35 previously audited IDs through Lookup and 15 exploration slots across its documented topic, language-query, and storefront strata. Storefront and query labels describe sampling context only; they do not establish publisher country or podcast origin. See [daily pipeline](daily-pipeline.md) for the persistent audit workflow and sampling behavior.
 
 For each API result with `feedUrl`, the collector retrieves only that RSS/Atom document. It maps channel-level website, description, categories, and language when available. Apple's title, collection ID, and genre metadata provide fallbacks/identifiers. Unavailable fields remain blank. It does not use the Apple listing URL or feed URL as a publisher website, and does not follow URLs from descriptions, episode entries, or arbitrary RSS content.
 
@@ -14,7 +14,7 @@ The collector writes `data/real_podcasts.csv` and `reports/real_podcasts_collect
 - Every redirect target is independently validated before it is requested. Redirects are manual and limited to three.
 - Explicit connection/read timeouts and a 4,000,000-byte response cap apply to API and RSS responses. Bodies are streamed and rejected as soon as the cap is exceeded; incomplete responses are not parsed as valid feeds. Requests are sequential; the collector spaces API searches by three seconds and RSS fetches by 0.4 seconds.
 - Environment proxy settings are disabled so a configured proxy cannot alter the destination.
-- DNS resolution is checked immediately before requesting, but `requests` resolves the hostname again while connecting. DNS rebinding between those operations remains possible; this implementation does not claim to eliminate that race.
+- Each destination's DNS answers are validated before the request, and libcurl's per-request resolve override pins the connection to an approved public IP while retaining the original hostname for the Host header and TLS certificate/hostname verification. Redirect destinations are independently resolved and validated before connection; proxy inheritance and automatic redirects are disabled.
 - RSS/XML/API failures are recorded and do not discard the Apple listing record. XML parsing is local; no embedded link is fetched.
 - No external network calls occur in the test suite. Its API behavior is mocked and its RSS behavior uses a controlled local HTTP server.
 

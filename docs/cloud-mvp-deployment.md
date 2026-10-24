@@ -6,7 +6,7 @@ The cloud MVP keeps SQLite as the audit store. GitHub Actions runs the existing 
 
 Merge the workflow and application changes to `master`, then open **Actions → Publish daily podcast audit → Run workflow**. The first successful run initializes `audit-snapshots`; later runs restore its database, append one run, validate it, and publish a new commit. The scheduled run is daily at 13:17 UTC. Manual and scheduled runs are serialized, and the publisher refuses to stage anything except `data/real_podcast_audits.sqlite`.
 
-The workflow needs the repository's default `GITHUB_TOKEN` with `contents: write`. It calls Apple's Search API and the RSS feeds returned by Apple using the existing bounded collector. It does not run publisher website checks. Runs that fail, are partial, fail validation, contain no records, or fail SQLite integrity checks are not published. Existing snapshot-branch content other than the single expected database file causes a fail-closed stop.
+The workflow needs the repository's default `GITHUB_TOKEN` with `contents: write`. It calls Apple Search/Lookup and the RSS feeds returned by Apple using the existing bounded collector, then runs the bounded publisher website-check stage. Each stage keeps its request, size, and time limits. Failed audits are not published. An RSS-partial audit may be published only when it meets the established partial-publication eligibility thresholds and passes validation, persistence, snapshot-structure, and SQLite integrity checks. Other partial or inconsistent results are rejected. Existing snapshot-branch content other than the single expected database file causes a fail-closed stop.
 
 ## 2. Deploy the dashboard
 
@@ -30,8 +30,8 @@ The app retrieves the raw SQLite file over HTTPS from the GitHub Contents API, v
 ## 3. Verify operation
 
 - Confirm the first workflow run publishes exactly one file to `audit-snapshots`.
-- Confirm the Streamlit app shows a successful, nonempty real audit.
+- Confirm the Streamlit app shows the latest nonempty real audit and its actual execution status, including partial status when applicable.
 - Run the workflow manually a second time and confirm the branch has a new commit and the dashboard history contains both runs.
-- Confirm the workflow fails without publishing if collection/validation is partial or failed, the result is empty, the SQLite integrity/schema check fails, the branch has unexpected files, or its tip changed while an audit was running.
+- Confirm the workflow rejects failed or ineligible partial collection, validation or persistence failure, empty results, SQLite integrity/schema errors, unexpected branch files, or a branch-tip change during the audit. A qualifying RSS-partial audit may publish only after all configured eligibility and integrity checks pass.
 
 The SQLite snapshot is versioned in Git, so each published commit retains the previous database blob in branch history. This is a compact MVP suitable for the current audit volume. Keep the snapshot below GitHub's 100 MB single-file limit; the dashboard applies a stricter 50 MiB download limit. If history approaches that limit, this storage layout will need revisiting.

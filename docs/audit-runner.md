@@ -19,7 +19,7 @@ The dashboard defaults to `data/real_podcast_audits.sqlite` when that file exist
 streamlit run app.py
 ```
 
-The dashboard reads the selected database in read-only mode. The saved snapshot appears under **Overview**, detailed findings under **What needs attention**, and records under **Podcast records**. **Website checks** shows a clear empty state when an offline audit saved no website results. The runner does not seed or fabricate URL results.
+The dashboard reads the selected database in read-only mode. The saved snapshot appears under **Overview**, findings under **Data quality**, saved observations under **Website health**, and records under **Podcast records**. Website health shows a clear empty state when an offline audit saved no website results. The runner does not seed or fabricate URL results.
 
 ## Optional website checks
 
@@ -29,7 +29,7 @@ Only use this option when you intend to request eligible HTTP(S) URLs from the i
 python -m src.audit_runner --input path\to\podcasts.csv --database data/podcast_audits.sqlite --check-websites
 ```
 
-The existing URL checker blocks localhost and non-global addresses and validates redirect destinations, but a separate DNS lookup and connection lookup leave a documented DNS-rebinding limitation. Do not use this option for the synthetic sample during the local-only first-run setup. The controlled local HTTP fixture is exercised by the URL-checker and evaluation tests instead:
+The existing URL checker blocks localhost and non-global addresses, pins connections to validated public IPs with libcurl, preserves TLS hostname verification, and revalidates every redirect destination. Do not use this option for the synthetic sample during the local-only first-run setup. The controlled local HTTP fixture is exercised by the URL-checker and evaluation tests instead:
 
 ```powershell
 python -m pytest tests/test_url_checker.py tests/test_evaluation.py -q

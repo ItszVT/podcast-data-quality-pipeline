@@ -1,61 +1,38 @@
 # Podcast Data Quality dashboard
 
-## Run locally
+## Data source and behavior
 
-From the repository root with the project virtual environment active:
+The dashboard reads saved SQLite audit snapshots in read-only mode. Local mode opens an existing database (default: `data/real_podcast_audits.sqlite`); a missing database is reported and never created or replaced with synthetic data. Published mode retrieves the latest database from the private `audit-snapshots` branch through GitHub's authenticated Contents API using a read-only token in Streamlit secrets. The snapshot is validated and loaded into an in-memory SQLite connection. The dashboard does not collect podcasts, contact publisher websites, or write audit history. **Refresh saved data** reloads the published snapshot.
 
-```powershell
-streamlit run app.py
-```
+The selected audit context remains visible throughout navigation: execution status, record count, source/storefront context, full audit ID, start and completion times in local time, and exact UTC timestamps in an expander. A partial status means some collection requests did not complete; it is separate from validation findings and persistence status. Saved records are retained, while the coverage warning explains what is incomplete.
 
-The database field selects an existing local audit database. The dashboard defaults to `data/real_podcast_audits.sqlite` and reports a missing real audit instead of silently falling back to synthetic data. A local missing database is never created. In published mode, the app fetches the latest SQLite snapshot from the private `audit-snapshots` Git branch using a read-only GitHub token in app secrets. The remote snapshot is deserialized into an in-memory SQLite connection and is not written to the app filesystem. **Refresh saved data** reloads the view. SQLite connections are read-only; dashboard actions do not write records or run website checks. See [cloud-mvp-deployment.md](cloud-mvp-deployment.md) for Streamlit Community Cloud setup.
+## Sections
 
-## Page structure
+- **Overview** — execution status, records analyzed, actionable errors, completeness notes, tested website targets, RSS retrieval coverage, website coverage, and an action-needed summary. Metrics apply to the selected audit.
+- **Data quality** — validation results grouped into actionable errors, optional-field completeness notes, other warnings, and information. Missing publisher country is not presented as an error; unknown country is retained unless reliable evidence supports a claim.
+- **Website health** — saved per-record outcomes, HTTP responses, redirect observations, and coverage. No saved checks produces a clear empty state; unchecked websites are not counted as successful or failed. A possible soft-404 is a heuristic classification, not proof that a site is unavailable.
+- **Geo intelligence** — evidence availability, structured creator and subject locations, declared and observed language evidence, supported conflicts, historical changes, and regional website observations. Apple storefront is catalog context only. Unknown origin, first observation, unavailable evidence, and not-tested regions remain distinct.
+- **Podcast records** — searchable records with filters for findings and missing websites, plus an expandable view of saved fields, source evidence, website observations, and geographic/language details.
+- **History** — saved audits, status and sample size, record-level error rates, collection size trends when at least two eligible audits exist, and comparisons between selected runs. Missing from a later sample does not mean a podcast was removed.
 
-- **Overview** — selected audit status and file/date context, five useful metrics, findings summary, and a clear website-check empty state.
-- **What needs attention** — findings grouped by category and field, with saved severity, affected-record counts, plain-language meaning, next steps, and expandable affected records. File-level findings are separated from podcast records.
-- **Podcast records** — search and filters for all records, records with/without findings, missing publisher websites, or a saved finding category. Selecting a record shows its saved fields and findings. The table hides internal database columns and is read-only.
-- **Website checks** — saved outcomes, response codes, redirects, and optional technical evidence. With no checks, the page says “No websites checked yet” and explicitly explains this is not a failure. It does not infer website health from missing observations.
-- **Audit history** — saved snapshots and a trend only when at least two audits exist; pairwise matching uses unique nonblank podcast IDs and does not invent change explanations.
-- **Evaluation** — describes automated tests, controlled reference cases, and real-world checks separately. Evaluation results are not persisted, so no accuracy score or confusion matrix is shown.
+The sidebar's **Methodology / About these checks** expander describes execution status, URL-check limits, geographic inference boundaries, controlled test evidence, and evaluation limits. These are details within the dashboard, not a seventh navigation section.
 
-## Metric definitions
+## Metric definitions and interpretation
 
-- **Records reviewed** is the number of podcast records saved for the selected audit.
-- **Records needing attention** counts distinct records with at least one saved record-level finding. A record with several findings counts once.
-- **Total findings** counts finding occurrences, including file-level findings. It can exceed the number of affected records.
-- **Missing publisher websites** counts null, empty, or whitespace-only source website values. RSS feed URLs are not publisher websites.
-- **Website checks completed** counts saved check observations. Unchecked records are neither successful nor failed.
-- Finding severity is the value stored by the existing validation rules (`error`, `warning`, or `info`). The dashboard does not alter validation rules.
+- **Podcasts analyzed** is the number of records persisted for the selected audit.
+- **Records with actionable errors** counts distinct selected-audit podcast records with at least one error-severity finding. File-level errors are listed separately.
+- **Completeness notes** count optional-field omissions. Missing descriptions, languages, or publisher country are not proof of invalid data. When RSS retrieval failed, missing RSS-derived metadata is not treated as confirmed absence; older audits may lack enough information to distinguish unavailable from unrecorded.
+- **Website checks** distinguish unique targets from per-record result rows where both are available. Percentages use the displayed denominator; unchecked records are not failures.
+- **History error rate** is records with at least one error-severity finding divided by records saved in that run. Failed and in-progress runs remain visible in history but are excluded from trend lines.
+- **Geographic drift** counts a change only when comparable evidence has different values. A first observation is not a change, and a missing or unavailable current observation does not erase the previous value.
+- **Regional website reliability** remains “Not tested” unless an authorized probe reports a verified exit country. The normal runner's location is not used as regional evidence.
 
-## Findings in the saved real-data audit
+All tables and metrics are scoped to the selected audit unless explicitly labeled as a comparison or history trend. Legacy audits remain viewable; where a field or source-availability marker was not stored, the dashboard reports it as legacy, unknown, or unavailable rather than inventing a value.
 
-The generated `data/real_podcast_audits.sqlite` currently contains one completed audit of `real_podcasts.csv` (audit ID `9feb0753-8dc3-491c-92fc-75e40b4979e5`). The actual saved snapshot contains:
+## Evidence limits
 
-| Measure | Saved value |
-|---|---:|
-| Records reviewed | 50 |
-| Records with at least one finding | 50 |
-| Finding occurrences | 89 |
-| Missing publisher websites | 13 |
-| Duplicate nonblank podcast IDs | 0 |
-| Website checks | 0 |
+Apple Search and Lookup provide catalog metadata, and RSS supplies publisher-controlled metadata when retrieval and parsing succeed. Storefront, language, category, and domain are not evidence of podcast origin. Geographic claims retain provenance and confidence; insufficient evidence remains unknown. Episode language is compared with declared language only when enough usable episode text is available, and raw episode text is not stored.
 
-The two stored finding categories are:
+URL outcomes are bounded observations. The checker validates public DNS answers and pins each request to an approved IP while retaining the original hostname for HTTP Host and TLS verification. Redirects are revalidated. HTTP errors, possible soft-404 content under HTTP 200, and inconclusive network results are separate classifications. They do not establish broad or permanent site availability.
 
-| Finding category | Severity | Occurrences | Records affected |
-|---|---|---:|---:|
-| Missing optional field — publisher country | Warning | 50 | 50 |
-| Missing optional field — description | Warning | 13 | 13 |
-| Missing optional field — language | Warning | 13 | 13 |
-| Blank publisher website | Error | 13 | 13 |
-
-The three field-level optional-field counts roll up to 76 `missing_optional_field` occurrences; adding 13 `blank_website_url` errors gives 89 total. Every record has at least the country warning, so all 50 have a finding, but only the 13 blank website records have an error-level finding under the current saved rules. The remaining optional metadata is blank rather than invented. The 13 missing publisher website values do not prove those websites are unavailable; the audit did not check any sites.
-
-## Chart label investigation
-
-The current saved podcast titles and categories do not contain `svg` or `canvas`, and neither string appears as a saved finding category. The previous charts were Plotly charts, which use browser SVG/canvas rendering elements internally. The reported words are therefore renderer/accessibility artifacts rather than podcast categories or validation results. The redesigned app uses Streamlit's native Vega-based charts for supported, nonempty datasets and does not render empty charts.
-
-## Interpretation and limits
-
-An audit is a saved snapshot. Trends require at least two snapshots and show aggregate counts, not causes. Website results are saved observations only; `inconclusive` is not silently converted to a failure. The four controlled reference cases are local examples for selected code paths and do not establish real-world accuracy. The dashboard never contacts public websites.
+Automated and controlled tests exercise defined code paths. They are not a representative sample of websites, podcasts, or global catalog coverage, and the dashboard does not claim a real-world accuracy score.

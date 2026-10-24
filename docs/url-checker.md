@@ -1,6 +1,6 @@
 # Day 3: Website URL checker
 
-The checker is implemented in `src/url_checker.py` and is called with `check_website_url(url, config=None)`. It returns a `UrlCheckResult` containing the original URL, safely reached final URL, HTTP status, redirect count and chain, elapsed time, classification, evidence, optional page title, and an error reason where appropriate.
+The checker is implemented in `src/url_checker.py` and is called with `check_website_url(url, config=None)`. It returns a `UrlCheckResult` containing the requested URL, safely reached final URL, HTTP status, redirect count and chain, elapsed time, classification, evidence, optional page title, and a fixed error category where appropriate.
 
 ## Classifications
 
@@ -12,26 +12,25 @@ The checker is implemented in `src/url_checker.py` and is called with `check_web
 | `inconclusive` | Timeout, connection/DNS failure, unsafe destination, redirect issue, oversized response, or other ambiguous result. |
 | `invalid_input` | Missing, malformed, or unsupported URL input. |
 
-Redirects are not their own failure classification. The checker disables Requests' automatic redirects, records each hop, validates each destination before the next request, and classifies the final response. Redirect destinations that fail validation are recorded in the chain but are never requested.
+Redirects are handled manually, not followed automatically. Each hop is recorded, independently resolved and validated, and requested only if all destination checks pass. The final response determines the classification; a redirect alone is not a failure.
 
 ## Safety controls and limits
 
-- Only absolute HTTP and HTTPS URLs are accepted. URL credentials are rejected.
-- Localhost names and any IP address that Python does not classify as globally routable are rejected. Hostnames are resolved before each request; every returned address must be globally routable.
-- Each redirect is checked under the same rules. Environment proxies are disabled so an ambient proxy cannot route around the destination check.
-- Connect and read timeouts, a maximum response byte count, and a redirect limit are configurable. Calls are sequential; the module creates no concurrent request workers.
-- Requests performs its own name resolution when opening the connection, separate from the safety lookup. A DNS answer could change between those operations. This implementation therefore does **not** claim complete DNS-rebinding protection. It is a proportionate local portfolio checker, not a complete SSRF defense for untrusted multi-user services.
-- Only a bounded portion of response content is read. Soft-404 phrases are heuristic; a false positive or missed error page is possible.
+- Only absolute HTTP and HTTPS URLs are accepted. URL credentials are rejected. Localhost and non-global IP destinations are blocked.
+- Hostnames are resolved with bounded DNS queries. Every returned IPv4/IPv6 address must be globally routable; a mixed public/private answer set is rejected.
+- For each request, the checker selects an approved address and configures libcurl's per-request resolve override to pin the connection to that IP. The original hostname remains in the URL, preserving the HTTP Host header and TLS SNI/certificate hostname verification. The connection cannot silently resolve that hostname to a different address.
+- Redirect destinations undergo the same DNS/IP validation and pinning before connection. Automatic redirects and environment proxy inheritance are disabled.
+- Checks are sequential. The pipeline caps the stage at 20 unique websites and 90 seconds; each request attempt is limited to five seconds. Response bodies are capped at 1,000,000 bytes and at most five redirects are followed. The stage may stop before all candidates are checked when its budget is exhausted.
+- Only a bounded response body is inspected. Soft-404 wording is heuristic, so false positives and missed error pages are possible. Results describe the time of a check and do not guarantee ongoing availability.
 
-The local-server test fixture uses a private test-only monkeypatch that makes the loopback server appear globally resolved to the safety check. Production code exposes no allow-private or test-bypass setting. Other safety tests exercise the normal resolver path, and the entire suite makes no requests to public websites.
+The controlled test fixtures use local HTTP servers with test-only resolver/public-address stubs. Those stubs are not exposed in production configuration. Automated tests do not contact public websites.
 
 ## Running the checks
 
 From the project root with the project virtual environment active:
 
 ```powershell
-python -m pytest
+python -m pytest tests/test_url_checker.py -q
 ```
 
-The controlled tests cover ordinary 200, HTTP 404, suspected soft 404, working and error redirects, private redirect rejection, timeout, mocked connection failure, invalid input, prohibited IP destinations, mixed public/private DNS answers, HTTPS URL acceptance at the safety-validation stage, and oversized responses both with and without `Content-Length`.
-
+The controlled tests cover ordinary 200, HTTP 404, suspected soft 404, redirects, private redirect rejection, timeout, mocked connection failures, invalid input, prohibited destinations, mixed public/private DNS answers, HTTPS certificate verification, DNS pinning, and oversized responses both with and without `Content-Length`.

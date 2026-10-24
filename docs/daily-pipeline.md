@@ -11,7 +11,7 @@ python -m src.daily_pipeline
 
 The command collects from Apple's iTunes Search API with the existing collector, validates the returned records using src.validation, and appends an audit snapshot using src.database. The default database is data/real_podcast_audits.sqlite. The runner writes collection metadata and findings to SQLite directly; it does not create or overwrite data/real_podcasts.csv, data/sample_podcasts.csv, or either dataset report.
 
-Website checks are not part of this command. The collector retains its existing HTTP(S)-only, DNS/IP, redirect, timeout, response-size, and request-pacing protections for API and RSS retrieval. Collection may contact Apple's API and RSS feed URLs supplied by Apple; tests use mocks and local fixtures only.
+Publisher website checks are off by default for this local command; the scheduled cloud workflow explicitly enables the bounded website-check stage. The collector retains its existing HTTP(S)-only, DNS/IP, redirect, timeout, response-size, and request-pacing protections for Apple API and RSS retrieval. Collection may contact Apple's API and RSS feed URLs supplied by Apple; tests use mocks and local fixtures only.
 
 ## Options
 
