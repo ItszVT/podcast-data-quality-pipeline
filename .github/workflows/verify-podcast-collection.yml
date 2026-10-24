@@ -92,43 +92,123 @@ jobs:
           allowed = {"succeeded", "partial", "failed", "skipped", "not_started"}
           status_keys = ("pipeline_status", "collection_status", "validation_status", "persistence_status")
           statuses = {key: result.get(key) for key in status_keys if result.get(key) in allowed}
-          report = result.get("collection_report")
-          report = report if isinstance(report, dict) else {}
+          report = None
+          run_id = result.get("audit_run_id")
+          unique_ids = 0
+          record_rows = 0
+          integrity_ok = False
+          metadata_json = None
+          if isinstance(run_id, str) and run_id:
+              try:
+                  with sqlite3.connect(database_path) as connection:
+                      integrity_ok = connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+                      record_rows = connection.execute(
+                          "SELECT COUNT(*) FROM podcast_records WHERE audit_run_id = ?",
+                          (run_id,),
+                      ).fetchone()[0]
+                      found = connection.execute(
+                          "SELECT COUNT(DISTINCT feed_id) FROM podcast_records WHERE audit_run_id = ?",
+                          (run_id,),
+                      ).fetchone()
+                      unique_ids = int(found[0]) if found else 0
+                      metadata_row = connection.execute(
+                          "SELECT metadata_json FROM audit_runs WHERE audit_run_id = ?",
+                          (run_id,),
+                      ).fetchone()
+                      metadata_json = metadata_row[0] if metadata_row else None
+              except sqlite3.Error:
+                  integrity_ok = False
+          if isinstance(metadata_json, str):
+              try:
+                  parsed_metadata = json.loads(metadata_json)
+                  if isinstance(parsed_metadata, dict):
+                      candidate_report = parsed_metadata.get("collection_report")
+                      if isinstance(candidate_report, dict):
+                          report = candidate_report
+              except json.JSONDecodeError:
+                  pass
+          diagnostics_available = isinstance(report, dict)
+          report = report if diagnostics_available else {}
           sampling = report.get("sampling")
           sampling = sampling if isinstance(sampling, dict) else {}
           lookup = sampling.get("repeat_lookup_outcomes")
           lookup = lookup if isinstance(lookup, dict) else {}
           rss = report.get("rss_outcome_counts")
           rss = rss if isinstance(rss, dict) else {}
-          lookup_errors = report.get("api_lookup_errors")
-          lookup_errors = lookup_errors if isinstance(lookup_errors, list) else []
-          search_errors = report.get("api_search_errors")
-          search_errors = search_errors if isinstance(search_errors, list) else []
-          provenance = report.get("record_provenance_by_feed")
-          provenance = provenance if isinstance(provenance, dict) else {}
+          lookup_errors_value = report.get("api_lookup_errors")
+          lookup_errors_available = isinstance(lookup_errors_value, list)
+          lookup_errors = lookup_errors_value if lookup_errors_available else []
+          search_errors_value = report.get("api_search_errors")
+          search_errors_available = isinstance(search_errors_value, list)
+          search_errors = search_errors_value if search_errors_available else []
+          rss_errors_available = isinstance(report.get("rss_errors"), list)
+          provenance_value = report.get("record_provenance_by_feed")
+          provenance_available = isinstance(provenance_value, dict)
+          provenance = provenance_value if provenance_available else {}
           source_counts = {"Apple iTunes Lookup API": 0, "Apple iTunes Search API": 0}
           for item in provenance.values():
               if isinstance(item, dict) and item.get("source") in source_counts:
                   source_counts[item["source"]] += 1
-          run_id = result.get("audit_run_id")
-          unique_ids = 0
-          record_rows = 0
-          integrity_ok = False
-          if isinstance(run_id, str):
-              with sqlite3.connect(database_path) as connection:
-                  integrity_ok = connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
-                  record_rows = connection.execute(
-                      "SELECT COUNT(*) FROM podcast_records WHERE audit_run_id = ?",
-                      (run_id,),
-                  ).fetchone()[0]
-                  found = connection.execute(
-                      "SELECT COUNT(DISTINCT feed_id) FROM podcast_records WHERE audit_run_id = ?",
-                      (run_id,),
-                  ).fetchone()
-                  unique_ids = int(found[0]) if found else 0
+          def read_count(value):
+              return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+          def read_nonnegative_number(value):
+              return value if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0 else None
+
+          def show_count(value):
+              count = read_count(value)
+              return str(count) if count is not None else "unavailable"
 
           def safe_count(value):
-              return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+              count = read_count(value)
+              return count if count is not None else 0
+
+          def show(mapping, key):
+              return show_count(mapping.get(key)) if key in mapping else "unavailable"
+
+          sampling_count_fields = (
+              "repeat_target", "exploration_target", "repeat_ids_selected_for_lookup",
+              "previously_audited_ids_unsupported", "actual_repeat_count", "actual_new_count",
+              "repeat_shortfall", "exploration_shortfall", "repeat_lookup_outcome_total",
+              "max_records", "record_cap_shortfall",
+          )
+          lookup_count_fields = (
+              "found", "deleted_or_unavailable", "mismatched_result",
+              "request_failure", "missing_required_metadata",
+          )
+          rss_count_fields = (
+              "missing_feed_url", "dns_failure", "connection_tls_failure", "http_error",
+              "timeout", "response_size_limit", "xml_parsing_failure",
+              "successful_parsing", "other_or_unknown_failure",
+          )
+          report_count_fields = (
+              "unique_records_retained", "rss_retrieval_successes", "rss_retrieval_failures",
+              "rss_timeout_unattempted_feeds",
+              "missing_rss_feed_urls", "rss_attempted_count", "rss_attempt_outcome_total",
+              "rss_record_outcome_total", "api_search_calls", "api_lookup_calls",
+          )
+          rss_timing_fields = (
+              "rss_collection_elapsed_seconds", "rss_collection_budget_seconds",
+              "rss_request_timeout_seconds",
+          )
+          diagnostics_complete = (
+              diagnostics_available
+              and isinstance(report.get("sampling"), dict)
+              and all(read_count(sampling.get(key)) is not None for key in sampling_count_fields)
+              and isinstance(report.get("sampling", {}).get("repeat_lookup_outcomes"), dict)
+              and all(read_count(lookup.get(key)) is not None for key in lookup_count_fields)
+              and isinstance(report.get("rss_outcome_counts"), dict)
+              and all(read_count(rss.get(key)) is not None for key in rss_count_fields)
+              and all(read_count(report.get(key)) is not None for key in report_count_fields)
+              and all(read_nonnegative_number(report.get(key)) is not None for key in rss_timing_fields)
+              and isinstance(report.get("rss_collection_timed_out"), bool)
+              and lookup_errors_available and search_errors_available and rss_errors_available
+              and provenance_available
+              and sum(source_counts.values()) == unique_ids
+              and sampling.get("repeat_lookup_outcomes_reconcile") is True
+              and report.get("rss_attempt_counts_reconcile") is True
+              and report.get("rss_record_counts_reconcile") is True
+          )
 
           safe_categories = {
               "dns_failure", "tls_certificate_verification", "tls_connection", "timeout",
@@ -137,6 +217,8 @@ jobs:
               "connection_failure", "request_failure",
           }
           def category_counts(errors):
+              if not isinstance(errors, list):
+                  return "unavailable"
               counts = {}
               for error in errors:
                   category = error.rsplit(":", 1)[-1].strip() if isinstance(error, str) else ""
@@ -145,10 +227,10 @@ jobs:
                   counts[category] = counts.get(category, 0) + 1
               return ", ".join(f"{name}={counts[name]}" for name in sorted(counts)) or "none"
 
-          elapsed = report.get("rss_collection_elapsed_seconds", 0)
+          elapsed = report.get("rss_collection_elapsed_seconds")
           if not isinstance(elapsed, (int, float)) or isinstance(elapsed, bool) or elapsed < 0:
-              elapsed = 0
-          runtime_seconds = 0
+              elapsed = None
+          runtime_seconds = None
           try:
               started = datetime.fromisoformat(result["started_at"])
               completed = datetime.fromisoformat(result["completed_at"])
@@ -160,27 +242,32 @@ jobs:
           print("- Collection: " + statuses.get("collection_status", "unknown"))
           print("- Validation: " + statuses.get("validation_status", "unknown"))
           print("- Persistence to temporary database: " + statuses.get("persistence_status", "unknown"))
-          print(f"- Repeat target / achieved: {safe_count(sampling.get('repeat_target'))} / {safe_count(sampling.get('actual_repeat_count'))}")
-          print(f"- Exploration target / achieved: {safe_count(sampling.get('exploration_target'))} / {safe_count(sampling.get('actual_new_count'))}")
-          print(f"- Repeat shortfall: {safe_count(sampling.get('repeat_shortfall'))}")
-          print(f"- Exploration shortfall: {safe_count(sampling.get('exploration_shortfall'))}")
-          print(f"- Record-cap shortfall: {safe_count(sampling.get('record_cap_shortfall'))}")
-          print(f"- Repeat lookup outcomes: found={safe_count(lookup.get('found'))}; unavailable/deleted={safe_count(lookup.get('deleted_or_unavailable'))}; mismatched={safe_count(lookup.get('mismatched_result'))}; request failures={safe_count(lookup.get('request_failure'))}; missing required metadata={safe_count(lookup.get('missing_required_metadata'))}; unsupported saved IDs={safe_count(sampling.get('previously_audited_ids_unsupported'))}")
-          print(f"- Repeat lookup request error categories: {category_counts(lookup_errors)}")
-          print(f"- Exploration search error categories: {category_counts(search_errors)}")
+          print("- Collection diagnostics: " + ("complete in this audit's SQLite metadata" if diagnostics_complete else "missing or incomplete in this audit's SQLite metadata"))
+          print(f"- Repeat target / achieved: {show(sampling, 'repeat_target')} / {show(sampling, 'actual_repeat_count')}")
+          print(f"- Exploration target / achieved: {show(sampling, 'exploration_target')} / {show(sampling, 'actual_new_count')}")
+          print(f"- Repeat shortfall: {show(sampling, 'repeat_shortfall')}")
+          print(f"- Exploration shortfall: {show(sampling, 'exploration_shortfall')}")
+          print(f"- Record-cap shortfall: {show(sampling, 'record_cap_shortfall')}")
+          print(f"- Repeat lookup outcomes: found={show(lookup, 'found')}; unavailable/deleted={show(lookup, 'deleted_or_unavailable')}; mismatched={show(lookup, 'mismatched_result')}; request failures={show(lookup, 'request_failure')}; missing required metadata={show(lookup, 'missing_required_metadata')}; unsupported saved IDs={show(sampling, 'previously_audited_ids_unsupported')}")
+          print("- Repeat lookup request error categories: " + category_counts(lookup_errors if lookup_errors_available else None))
+          print("- Exploration search error categories: " + category_counts(search_errors if search_errors_available else None))
           print(f"- Unique IDs persisted for this verification run: {unique_ids}")
           print(f"- Podcast rows persisted for this verification run: {safe_count(record_rows)}")
-          print(f"- Source coverage: {source_counts['Apple iTunes Lookup API']} ID lookups; {source_counts['Apple iTunes Search API']} search results")
-          print(f"- Total pipeline runtime: {runtime_seconds} seconds")
-          print(f"- RSS: {safe_count(report.get('rss_retrieval_successes'))} parsed; {safe_count(report.get('rss_retrieval_failures'))} failed or unattempted; {safe_count(report.get('missing_rss_feed_urls'))} missing feed URLs")
+          if provenance_available:
+              print(f"- Source coverage: {source_counts['Apple iTunes Lookup API']} lookup records; {source_counts['Apple iTunes Search API']} search records")
+          else:
+              print("- Source coverage: unavailable")
+          print("- Total pipeline runtime: " + (f"{runtime_seconds} seconds" if runtime_seconds is not None else "unavailable"))
+          print(f"- RSS: {show(report, 'rss_retrieval_successes')} parsed; {show(report, 'rss_retrieval_failures')} failed or unattempted; {show(report, 'missing_rss_feed_urls')} missing feed URLs")
           print("- RSS attempt categories: " + ", ".join(
-              f"{name}={safe_count(rss.get(name))}" for name in (
+              f"{name}={show(rss, name)}" for name in (
                   "dns_failure", "connection_tls_failure", "http_error", "timeout",
                   "response_size_limit", "xml_parsing_failure", "successful_parsing",
                   "other_or_unknown_failure",
               )
           ))
-          print(f"- RSS stage: {elapsed:.1f} seconds; deadline reached: {bool(report.get('rss_collection_timed_out'))}")
+          print(f"- RSS stage: {elapsed:.1f} seconds" if elapsed is not None else "- RSS stage: unavailable")
+          print("- RSS deadline reached: " + (str(report["rss_collection_timed_out"]) if isinstance(report.get("rss_collection_timed_out"), bool) else "unavailable"))
           print(f"- Temporary SQLite integrity: {'ok' if integrity_ok else 'failed'}")
 
           lookup_selected = safe_count(sampling.get("repeat_ids_selected_for_lookup"))
@@ -244,7 +331,11 @@ jobs:
               and statuses.get("persistence_status") == "succeeded"
               and unique_ids > 0
               and unique_ids == record_rows
+              and unique_ids == safe_count(result.get("records_stored"))
               and unique_ids == safe_count(report.get("unique_records_retained"))
+              and diagnostics_complete
+              and source_counts["Apple iTunes Lookup API"] == safe_count(sampling.get("actual_repeat_count"))
+              and source_counts["Apple iTunes Search API"] == safe_count(sampling.get("actual_new_count"))
               and integrity_ok
               and safe_count(sampling.get("repeat_target")) == 35
               and safe_count(sampling.get("exploration_target")) == 15

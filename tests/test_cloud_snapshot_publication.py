@@ -8,6 +8,7 @@ import pytest
 
 SNAPSHOT_FILE = "data/real_podcast_audits.sqlite"
 WORKFLOW_FILE = Path(__file__).parents[1] / ".github/workflows/cloud-daily-audit.yml"
+VERIFY_WORKFLOW_FILE = Path(__file__).parents[1] / ".github/workflows/verify-podcast-collection.yml"
 
 
 def git(repo: Path, *args: str) -> str:
@@ -101,4 +102,18 @@ def test_unexpected_staged_file_rejects_publication(tmp_path: Path):
         AssertionError, match="not limited to the SQLite snapshot"
     ):
         assert_snapshot_is_only_staged_file(repo)
+
+
+def test_collection_verification_reads_run_scoped_report_and_rejects_missing_diagnostics():
+    workflow = VERIFY_WORKFLOW_FILE.read_text(encoding="utf-8")
+
+    assert '"SELECT metadata_json FROM audit_runs WHERE audit_run_id = ?"' in workflow
+    assert 'parsed_metadata.get("collection_report")' in workflow
+    assert 'result.get("collection_report")' not in workflow
+    assert "missing or incomplete in this audit's SQLite metadata" in workflow
+    assert 'return str(count) if count is not None else "unavailable"' in workflow
+    assert "and diagnostics_complete" in workflow
+    assert "contents: read" in workflow
+    assert "workflow_dispatch:" in workflow
+    assert "git push" not in workflow
 

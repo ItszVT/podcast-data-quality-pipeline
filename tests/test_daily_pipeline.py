@@ -460,6 +460,44 @@ def test_cli_exit_code_and_json_summary_match_run_status(
         assert any("Apple ID lookup" in item for item in summary["stage_failures"])
 
 
+def test_cli_json_schema_keeps_collection_report_in_run_scoped_sqlite_metadata(
+    tmp_path, monkeypatch, capsys
+):
+    database = tmp_path / "report-schema.sqlite"
+    collection_report = {
+        "sampling": {"repeat_target": 35, "actual_repeat_count": 1},
+        "record_provenance_by_feed": {"itunes:collection:1": {"source": "Apple iTunes Lookup API"}},
+    }
+    monkeypatch.setattr(
+        daily_pipeline_module,
+        "collect_podcasts",
+        lambda *_args, **_kwargs: collection([record()], **collection_report),
+    )
+
+    assert daily_pipeline_module.main([
+        "--database", str(database), "--run-id", "report-schema-run"
+    ]) == 0
+    summary = json.loads(capsys.readouterr().out)
+
+    assert set(summary) == {
+        "audit_run_id", "preflight_status", "started_at", "completed_at",
+        "pipeline_status", "collection_status", "validation_status", "persistence_status",
+        "database_path", "records_collected", "records_validated", "records_stored",
+        "records_with_findings", "finding_occurrences", "issue_counts", "stage_failures",
+        "website_check_status", "website_check_unique_urls", "website_check_records",
+    }
+    assert summary["audit_run_id"] == "report-schema-run"
+    assert "collection_report" not in summary
+    with read_database(database) as db:
+        row = db.execute(
+            "SELECT metadata_json FROM audit_runs WHERE audit_run_id = ?",
+            (summary["audit_run_id"],),
+        ).fetchone()
+    metadata = json.loads(row[0])
+    assert metadata["collection_report"]["sampling"] == collection_report["sampling"]
+    assert metadata["collection_report"]["record_provenance_by_feed"] == collection_report["record_provenance_by_feed"]
+
+
 def test_preflight_failure_reports_run_id_without_starting_collection(tmp_path, monkeypatch, capsys):
     called = False
 
