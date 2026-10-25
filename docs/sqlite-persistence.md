@@ -13,6 +13,12 @@ All run-scoped tables have foreign keys. Indexes support lookups by run, start t
 
 This snapshot-oriented `podcast_records` table is the persistence form of the input contract. It replaces the initially proposed mutable current-state `podcasts` table so each run can retain duplicate, missing, and otherwise problematic source rows without requiring a valid unique identifier. Unrecognized source columns are preserved in `record_json` when the existing validation records are passed to persistence.
 
+## Backend configuration
+
+For optional PostgreSQL connection and explicit schema migrations, see [PostgreSQL foundation](postgres-foundation.md).
+
+The local backend remains SQLite by default. Set `PODCAST_DB_BACKEND=sqlite` to select it explicitly; existing commands may continue supplying their SQLite file path as before. PostgreSQL configuration can be prepared with `PODCAST_DB_BACKEND=postgres` and `PODCAST_DATABASE_URL`, but PostgreSQL persistence and dashboard access are not implemented in this step. SQLite-only operations fail clearly when PostgreSQL is selected and do not fall back to SQLite. The URL is not included in configuration representations or configuration errors. No PostgreSQL connection is opened.
+
 ## Initialize and save a run
 
 From the project root, with the virtual environment active:

@@ -1,5 +1,7 @@
 # Real Podcast Dataset Collection Report
 
+> **Historical transport note:** This report records the behavior of the collector used for the 2026-10-24 collection. Its DNS lookup description below is historical and does not describe the current collector, which pins each request to a validated IP while retaining hostname and TLS verification. See [the current URL checker documentation](../docs/url-checker.md). The collection counts and findings below are preserved as recorded.
+
 - Collection date: 2026-10-24
 - Source: Apple iTunes Search API and publisher RSS channel metadata
 - API endpoint: `https://itunes.apple.com/search`
@@ -25,7 +27,7 @@
 - Publisher country is blank because storefront country does not establish publisher location.
 - Only API-provided feedUrl values are fetched. RSS website links supply publisher website metadata; feed URLs are never substituted as websites.
 - RSS requests are sequential, response-size limited, timeout bounded, and every redirect is checked against public IP destinations.
-- DNS is checked immediately before connection, but the HTTP library resolves again; DNS rebinding between validation and connection remains possible.
+- **Historical transport behavior for this collection:** DNS was checked immediately before connection, but the HTTP library resolved again; DNS rebinding between validation and connection remained possible in that implementation.
 - Descriptions and arbitrary RSS links are text only and are never fetched.
 
 ## RSS retrieval errors

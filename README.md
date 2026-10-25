@@ -1,94 +1,120 @@
 # Podcast Data Quality & Analytics Pipeline
 
-A Python portfolio project that collects real podcast catalog metadata, validates records, checks publisher websites with bounded requests, and preserves audit history for SQL analysis and a read-only Streamlit dashboard.
+- Live dashboard: [podcast-data-quality-pipeline.streamlit.app](https://podcast-data-quality-pipeline.streamlit.app/)
+- Python CI: [GitHub Actions workflow](https://github.com/ItszVT/podcast-data-quality-pipeline/actions/workflows/python-tests.yml)
 
-## What it does
+## Overview
 
-- Collects up to 50 unique Apple podcast IDs per daily audit. The deterministic plan targets **35 previously observed podcasts** for longitudinal comparison and **15 exploration slots** across documented topic, language-query, and storefront strata. Apple storefront is sampling context only; it is not publisher location or podcast origin.
-- Retrieves RSS metadata with sequential, bounded requests. The current response cap is **4,000,000 bytes per response**; only fully retrieved, valid XML is parsed. Missing RSS fields remain missing, and individual fetch failures are retained as partial-collection evidence.
-- Validates records and saves each run as an append-only SQLite audit. Repeated podcasts remain separate observations, so history is preserved rather than overwritten.
-- Runs optional publisher website checks through a security-focused URL checker. It vets every DNS answer, pins each request to an approved public IP, retains the hostname for HTTP Host and TLS certificate verification, validates redirects independently, disables proxy inheritance and automatic redirects, and applies request, response, and stage limits. HTTP failures and possible soft-404 pages are distinct evidence-based outcomes.
-- Presents saved audit execution status, data-quality findings, website observations, geographic evidence, searchable records, and history in Streamlit. The dashboard reads SQLite in read-only mode and never runs collection or website requests.
+This project checks the quality and availability of podcast catalog data. It collects podcast listings from Apple Podcasts, reads publisher RSS feeds, validates metadata, checks a bounded set of publisher websites, and keeps each audit for comparison over time.
+
+The Streamlit dashboard presents saved audit results. It separates pipeline status from data findings, shows which website checks ran, and provides geographic information only when source evidence supports it.
+
+## How it works
+
+The scheduled GitHub Actions workflow runs the daily collection and publishes a validated SQLite snapshot. Each run restores the previous database and appends a new audit, preserving earlier observations.
+
+The collection plan targets up to 50 unique Apple podcast IDs: 35 repeats for comparisons over time and 15 exploration records selected across documented topic, language-query, and storefront groups. The allocation is configurable, and the run report records achieved counts and shortfalls. Apple storefront is collection context; it does not establish publisher location or podcast origin.
+
+For each record, the pipeline requests RSS metadata sequentially. Responses are limited to 4,000,000 bytes and must be completely retrieved and parse as valid XML. Missing fields remain missing, and retrieval failures are recorded as incomplete collection evidence.
+
+Publisher website checks use a separate, bounded stage. The checker validates DNS answers, pins requests to approved public IP addresses, verifies the original hostname and TLS certificate, and revalidates each redirect. It does not inherit proxy settings or follow redirects automatically. HTTP failures and possible soft-404 pages are reported as separate outcomes. The daily workflow enables website checks; local collection leaves them off unless `--check-websites` is supplied.
 
 ## Architecture
 
-```text
-GitHub Actions (daily or manual)
-  └─ Python collection → Apple Search/Lookup → bounded RSS enrichment
-     → validation → SQLite audit snapshot → integrity/publication checks
-        └─ versioned SQLite file on audit-snapshots branch
-           └─ Streamlit Community Cloud reads the private snapshot
-              through GitHub's Contents API using a read-only token
+1. GitHub Actions collects podcast listings, retrieves RSS metadata, validates records, and appends an audit to SQLite.
+2. The workflow checks database integrity and publishes the SQLite snapshot to the `audit-snapshots` branch.
+3. Streamlit Community Cloud reads the private snapshot through GitHub's Contents API with a read-only token.
+4. Local CSV and XLSX files can also be ingested into SQLite for analysis with SQL and the local dashboard.
 
-Local CSV/XLSX → Python ingestion and validation → SQLite
-                                      ├─ SQL analytics
-                                      └─ local read-only Streamlit dashboard
-```
+The dashboard reads SQLite in read-only mode. It does not run collection or website requests. Publication runs are serialized, restore the previous snapshot, and publish only the validated SQLite file. A partial RSS audit may be published only when collection thresholds, validation, persistence, and SQLite integrity checks pass.
 
-GitHub Actions serializes publication runs, restores the previous database, appends a new audit, validates the result, and publishes only the SQLite snapshot file. Recoverable RSS-partial audits may be published only when the established collection thresholds, validation, persistence, and SQLite integrity checks pass. Failed or inconsistent runs are not published. The dashboard never syncs or writes the snapshot branch itself.
+## Dashboard preview
 
-## Implementation status
+The dashboard shows the selected audit's status and findings, with detailed records available in separate sections.
 
-**Implemented:** Python collection, validation, secure website checks, SQLite persistence and history, SQL analyses, GitHub Actions audit/snapshot publication, and the Streamlit dashboard.
+**Overview** — audit status, execution details, and items that need attention.
 
-**PostgreSQL groundwork only:** optional connection configuration, strict remote TLS settings, migrations, and integration-test scaffolding are present. The production pipeline and dashboard still use SQLite; PostgreSQL persistence, migration of audit history, and dashboard support are not implemented.
+![Overview showing audit status and execution details](docs/images/overview.png)
 
-## Verified collection evidence
+**Data quality** — actionable errors separated from notes about missing optional fields.
 
-A successful controlled GitHub Actions verification collected **35/35 repeat IDs** through Apple Lookup and **15/15 exploration IDs** through Apple Search, persisting 50 unique records. In that run, 42 of 50 RSS feeds parsed; six exceeded the 4 MB cap, one timed out, and one record had no RSS URL. The audit was therefore correctly marked partial while validation, persistence, and SQLite integrity succeeded. This is one verification run, not a promise about every production audit.
+![Data quality findings and completeness notes](docs/images/data_quality.png)
 
-A separate paired experiment tested the same 50 IDs and resolved feed URLs at 2 MB and 4 MB. Complete RSS parses increased from 36 to 42, six feeds were recovered, and no previously successful parse regressed. Sampled peak process memory was 68.03 MiB at 2 MB and 70.7 MiB at 4 MB. These experimental results describe that sample only; they do not establish performance for every audit.
+**Website health** — saved website observations and their classifications for the selected audit.
 
-Apple search ranking, publisher-controlled RSS availability, and metadata completeness vary. The dataset is not a globally representative sample. Synthetic fixtures are kept separate from real production audits; no synthetic records are inserted into production history.
+![Website observations and classifications](docs/images/website_health.png)
 
-## Run locally
+## Tech stack
 
-Python 3.11 or newer is recommended. In PowerShell:
+- Python 3.11 for collection, validation, URL checks, and pipeline orchestration
+- SQLite for append-only audit history and published snapshots
+- SQL for run-scoped quality measures, website outcomes, and historical comparisons
+- Streamlit for the read-only dashboard
+- GitHub Actions for scheduled collection, snapshot publication, and Python regression tests
+
+PostgreSQL support is groundwork only: optional connection configuration, TLS checks, migrations, and test scaffolding exist. The production pipeline, persistence layer, and dashboard use SQLite; PostgreSQL audit persistence and dashboard support are not implemented.
+
+## Results and limits
+
+In one controlled GitHub Actions verification, the pipeline recovered 35 of 35 repeat IDs through Apple Lookup and collected 15 of 15 exploration IDs through Apple Search. It persisted 50 unique records. RSS parsing succeeded for 42 records; six responses exceeded the 4 MB limit, one request timed out, and one record had no feed URL. The audit was marked partial, while validation, persistence, and SQLite integrity checks succeeded. These figures describe that run only.
+
+A separate paired experiment applied 2 MB and 4 MB limits to the same 50 IDs and resolved feed URLs. Complete RSS parses increased from 36 to 42, with no successful parse at 2 MB failing at 4 MB. Sampled peak process memory was 68.03 MiB and 70.7 MiB, respectively. These measurements apply to the experimental sample, not every audit.
+
+Apple search results depend on query terms and storefront. RSS availability and publisher metadata are controlled by publishers. The collection is not globally representative, and the project does not infer country of origin from language, domain, category, or storefront. Synthetic fixtures are used for tests only and are not added to production audit history.
+
+A partial audit means some collection evidence is missing; it does not by itself mean that saved records were discarded or that persistence failed. Missing RSS data can reflect an absent feed URL, an unavailable feed, or incomplete metadata. Older audits may not distinguish all of these cases. Website outcomes apply only to URLs actually checked.
+
+## Running locally
+
+Python 3.11 or newer is recommended. From PowerShell:
 
 ```powershell
 py -3 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 pip install -r requirements.txt
-python -m pytest
 ```
 
-Run an offline CSV audit:
+Run the tests:
+
+```powershell
+python -m pytest -q
+```
+
+Run an offline CSV audit using the included sample data:
 
 ```powershell
 python -m src.audit_runner --input data/sample_podcasts.csv --database data/podcast_audits.sqlite
 ```
 
-Run the real collection pipeline (uses public Apple and RSS endpoints):
+Run live Apple and RSS collection:
 
 ```powershell
 python -m src.daily_pipeline --database data/real_podcast_audits.sqlite
 ```
 
-The daily pipeline does not check publisher websites unless explicitly run with `--check-websites`. Website checks are capped at 20 unique URLs and use the existing 90-second stage budget. Review [daily pipeline options and status semantics](docs/daily-pipeline.md) before running live collection.
+Website checks are opt-in locally. Add `--check-websites` to the command to run them. Checks are limited to 20 unique URLs and a 90-second stage budget. The scheduled GitHub Actions workflow enables them explicitly. See [daily pipeline options and status semantics](docs/daily-pipeline.md) before running live collection.
 
-Launch the dashboard:
+Start the dashboard with:
 
 ```powershell
 streamlit run app.py
 ```
 
-The local dashboard opens an existing SQLite database read-only and reports missing data instead of substituting synthetic records. Published mode reads the latest database snapshot from the private `audit-snapshots` branch; setup is documented in [cloud deployment](docs/cloud-mvp-deployment.md).
+The local dashboard reads an existing SQLite database without writing to it. Published mode reads the latest snapshot from the private `audit-snapshots` branch; configuration is described in [cloud deployment](docs/cloud-mvp-deployment.md).
 
-## Dashboard guide
+## SQL analysis and documentation
 
-The six navigation sections are **Overview**, **Data quality**, **Website health**, **Geo intelligence**, **Podcast records**, and **History**. The **Methodology / About these checks** expander in the sidebar explains status, evidence limits, and evaluation context. The selected audit's ID, source, timestamp, and execution status remain visible across sections. See [dashboard definitions and interpretation](docs/dashboard.md).
+The [`sql/`](sql/) directory contains queries for row counts, validation issues and rates, website outcomes and HTTP statuses, redirects, missing website URLs, duplicate feed IDs, and audit-to-audit comparisons. [The SQL analysis guide](docs/sql-analytics-evaluation.md) explains measures, denominators, and interpretation limits.
 
-A partial audit means collection evidence is incomplete; it does not mean saved records were discarded or that the database failed. Missing RSS metadata is distinct from a successful source check with no claim, and older audits may not contain enough source-availability detail to distinguish those cases. Website results describe only sites actually checked. Geo Intelligence reports unknown origin when evidence is insufficient; it does not infer origin from language, storefront, or domain.
+Further documentation:
 
-## Data, SQL, and documentation
-
-- `src/` contains ingestion, collection, validation, URL checking, persistence, pipeline orchestration, and dashboard data access.
-- `sql/` contains run-scoped analytics queries and their definitions.
-- `data/sample_podcasts.csv` and controlled reference cases are synthetic test fixtures. Real collected metadata is kept separate and should be redistributed only after reviewing source terms and attribution requirements.
+- [Dashboard sections and metric definitions](docs/dashboard.md)
+- [Daily pipeline options and status semantics](docs/daily-pipeline.md)
 - [Real collection provenance and safeguards](docs/real-dataset-collection.md)
 - [SQLite schema and append-only history](docs/sqlite-persistence.md)
-- [PostgreSQL foundation and explicit limitations](docs/postgres-foundation.md)
+- [PostgreSQL groundwork and limitations](docs/postgres-foundation.md)
 - [Cloud deployment and snapshot operation](docs/cloud-mvp-deployment.md)
+- [Website checker security and classifications](docs/url-checker.md)
 
-The test suite uses temporary databases, mocked API calls, and local fixtures. It does not contact public sites or Neon. No credentials are intended to be stored in source control, SQLite snapshots, or workflow logs.
+The sample CSV and controlled reference cases are synthetic test fixtures. Real collected metadata is kept separate; review source terms and attribution requirements before redistributing it. Tests use temporary databases, mocked API calls, and local fixtures rather than contacting public sites or Neon. Credentials should not be stored in source control, SQLite snapshots, or workflow logs.
